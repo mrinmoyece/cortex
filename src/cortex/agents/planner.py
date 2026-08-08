@@ -22,6 +22,7 @@ from cortex.exceptions import AgentPlanningError
 from cortex.graph.state import CortexState, Task
 from cortex.llm.router import get_router
 from cortex.logging_config import get_logger
+from cortex.obs.tracing import observe
 
 logger = get_logger(__name__)
 
@@ -55,6 +56,7 @@ class PlannerAgent:
     def __init__(self) -> None:
         self._router = get_router()
 
+    @observe("planner.plan", capture=("run_id",))
     async def plan(self, state: CortexState) -> list[Task]:
         """
         Decompose `state.user_goal` into an ordered task list.

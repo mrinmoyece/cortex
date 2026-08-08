@@ -23,6 +23,7 @@ from cortex.config import settings
 from cortex.exceptions import EmbeddingError, IngestionError, RetrievalError
 from cortex.logging_config import get_logger
 from cortex.obs.metrics import rag_documents_ingested, rag_retrieval_duration
+from cortex.obs.tracing import observe
 
 logger = get_logger(__name__)
 
@@ -319,6 +320,7 @@ class RAGPipeline:
         self._reranker = CohereReranker()
         self._all_docs: list[Document] = []  # For BM25 indexing
 
+    @observe("rag.ingest")
     async def ingest(self, text: str, metadata: dict | None = None) -> int:
         """
         Ingest a text document into the RAG pipeline.
@@ -349,6 +351,7 @@ class RAGPipeline:
         logger.info("rag.ingested", chunks=len(chunks), metadata=metadata)
         return len(chunks)
 
+    @observe("rag.retrieve")
     async def retrieve(
         self,
         query: str,

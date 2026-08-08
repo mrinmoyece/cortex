@@ -28,6 +28,7 @@ from qdrant_client.models import Distance, PointStruct, VectorParams
 from cortex.config import settings
 from cortex.graph.state import CortexState, MemoryContext
 from cortex.logging_config import get_logger
+from cortex.obs.tracing import observe
 
 logger = get_logger(__name__)
 
@@ -256,6 +257,7 @@ class MemoryAgent:
         self.episodic = EpisodicMemory()
         self.semantic = SemanticMemory()
 
+    @observe("memory.retrieve")
     async def retrieve(
         self, user_goal: str, session_id: str, user_id: str, tenant_id: str = DEFAULT_TENANT
     ) -> MemoryContext:
@@ -275,6 +277,7 @@ class MemoryAgent:
         )
         return MemoryContext(episodic=episodic, semantic=semantic)
 
+    @observe("memory.consolidate")
     async def consolidate(self, state: CortexState) -> None:
         """Persist run summary to episodic and extract facts to semantic."""
         summary = {

@@ -19,6 +19,7 @@ from cortex.graph.state import CortexState, CritiqueResult
 from cortex.llm.router import get_router
 from cortex.logging_config import get_logger
 from cortex.obs.metrics import critic_rejection_total, critic_score_histogram
+from cortex.obs.tracing import observe
 
 logger = get_logger(__name__)
 
@@ -49,6 +50,7 @@ class CriticAgent:
     def __init__(self) -> None:
         self._router = get_router()
 
+    @observe("critic.critique")
     async def critique(self, state: CortexState) -> CritiqueResult:
         """
         Evaluate state.final_output and return a CritiqueResult.

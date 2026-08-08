@@ -28,6 +28,10 @@ dependencies = [
 
     # Evaluation
     "ragas>=0.2.0",
+    # Agent-level metrics. Optional at runtime - see
+    # `eval/agent_eval.py`: three of four axes are computed from the run's
+    # own structure and need no model, so the fallback is not a stub.
+    "deepeval>=2.0.0",
 
     # Memory
     "redis[hiredis]>=5.0.0",

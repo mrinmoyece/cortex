@@ -145,3 +145,51 @@ This is less reliable than Ragas (which uses dedicated models and multi-sample c
 - Retrieval quality degraded — check embedding model and Qdrant index health
 - Chunk size too large — chunks contain too much irrelevant content
 - Consider tuning `RAG_BM25_WEIGHT` and `RAG_DENSE_WEIGHT`
+
+
+## Two harnesses, because they answer different questions
+
+| harness | scores | backend |
+|---|---|---|
+| `eval/ragas_runner.py` | retrieval and generation — faithfulness, answer relevancy, context precision | Ragas, falling back to an LLM judge |
+| `eval/agent_eval.py` | the agent loop — task completion, tool correctness, plan efficiency, termination | DeepEval, falling back to deterministic metrics |
+
+Ragas cannot see the part of Cortex that makes it an agent. It has no notion
+of a goal, tool calls are invisible to it, and it cannot tell a run that
+converged from one that was stopped by a budget ceiling.
+
+Before this, the only thing scoring the agent loop was the critic — which is
+*part of* the loop. A system grading its own homework produces a number
+that is stable, plausible and worthless.
+
+### The fallback is not a stub
+
+Three of the four agent axes need no model at all: tool correctness, plan
+efficiency and termination are computed from the run's own structure. Only
+task completion degrades to an LLM judge.
+
+That split is deliberate. DeepEval and Ragas are both heavy optional
+dependencies, and the environment least likely to have them installed is
+CI — which is exactly where the harness needs to still measure something.
+
+### Thresholds are per-axis, not on the average
+
+`passes()` checks completion, tool correctness and termination separately.
+An average lets one collapsed dimension hide behind three healthy ones, and
+"terminated correctly 40% of the time" is not something an overall 0.8
+should be able to conceal.
+
+`termination` carries the strictest threshold (0.90) because it is the
+failure users actually notice: a loop that exhausts its budget produces a
+bill and no answer.
+
+Plan efficiency is **reported but not gated**. An inefficient plan that
+reaches the right answer is a cost problem, not a correctness one — it
+belongs on a dashboard, not in a gate that blocks a release.
+
+### An unreachable judge scores 0.5
+
+Not 0.0 and not 1.0. Scoring an outage as a failure makes it look like a
+quality regression; scoring it as a pass lets an outage hide one. The score
+carries `"not evidence"` in its detail string so a report cannot quote it
+as a measurement.

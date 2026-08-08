@@ -17,6 +17,7 @@ from cortex.graph.state import CortexState, Task
 from cortex.llm.router import get_router
 from cortex.logging_config import get_logger
 from cortex.mcp.client import get_mcp_client
+from cortex.obs.tracing import observe
 from cortex.safety.moderation import spotlight
 
 logger = get_logger(__name__)
@@ -46,6 +47,7 @@ class ExecutorAgent:
         self._router = get_router()
         self._mcp = get_mcp_client()
 
+    @observe("executor.execute_task")
     async def execute_task(self, task: Task, state: CortexState) -> tuple[Task, float]:
         """
         Execute a single task.
@@ -165,6 +167,7 @@ class ExecutorAgent:
 
         return "\n".join(parts)
 
+    @observe("executor.compile_output")
     async def compile_output(self, tasks: list[Task], state: CortexState) -> str:
         """Synthesise all task results into the final user-facing answer."""
         task_results = "\n".join(

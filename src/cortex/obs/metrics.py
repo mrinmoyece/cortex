@@ -158,6 +158,28 @@ hallucination_score = Histogram(
 # traces, where you can pivot on run_id; what a metric should answer is
 # "what does a run cost, typically and at the tail", which a histogram
 # answers directly and a per-run gauge cannot.
+agent_eval_score = Histogram(
+    "cortex_agent_eval_score",
+    "Per-axis agent evaluation scores. Labelled by metric, never by run - "
+    "the distribution is the signal, an individual run is a trace.",
+    labelnames=["metric"],
+    buckets=(0.0, 0.25, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0),
+)
+
+agent_step_duration = Histogram(
+    "cortex_agent_step_duration_seconds",
+    "Wall-clock duration of one instrumented agent step.",
+    labelnames=["step"],
+    buckets=(0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+)
+
+agent_step_failures = Counter(
+    "cortex_agent_step_failures_total",
+    "Agent steps that raised. Labelled by step and exception type - never "
+    "by run or user, which are unbounded.",
+    labelnames=["step", "error_type"],
+)
+
 rate_limit_rejections = Counter(
     "cortex_rate_limit_rejections_total",
     "Requests rejected by the API rate limiter. A sustained rate means "
