@@ -1,0 +1,153 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cortex full local stack
+#
+# Services:
+#   cortex-api      — FastAPI application (port 8000)
+#   cortex-mcp      — MCP server (port 8001)
+#   cortex-worker   — Celery background worker
+#   cortex-beat     — Celery scheduler (eval regression + memory consolidation)
+#   redis          — Episodic memory, semantic cache, Celery broker
+#   qdrant         — Vector store (RAG + semantic memory)
+#   phoenix        — Arize Phoenix LLM trace UI (port 6006)
+#   prometheus     — Metrics scraper (port 9090)
+#   grafana        — Dashboards (port 3000)
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-cortex-common: &cortex-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  depends_on:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    qdrant:
+      condition: service_healthy
+  restart: unless-stopped
+  networks:
+    - cortex-net
+
+services:
+
+  # ── Application ─────────────────────────────────────────────────────────────
+
+  cortex-api:
+    <<: *cortex-common
+    command: cortex-api
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  cortex-mcp:
+    <<: *cortex-common
+    command: cortex-mcp
+    ports:
+      - "8001:8001"
+
+  cortex-worker:
+    <<: *cortex-common
+    command: celery -A cortex.workers.celery_app worker --loglevel=info --concurrency=4
+
+  cortex-beat:
+    <<: *cortex-common
+    command: celery -A cortex.workers.celery_app beat --loglevel=info
+
+  # ── Data stores ──────────────────────────────────────────────────────────────
+
+  # Celery's monitoring UI. It was declared in pyproject and wired into
+  # nothing, which is the same defect as an unused dependency with an
+  # operational cost: you cannot see the queue you claim to operate.
+  cortex-flower:
+    build: .
+    command: celery -A cortex.workers.celery_app flower --port=5555
+    env_file: .env
+    ports: ["5555:5555"]
+    depends_on: [redis]
+    restart: unless-stopped
+    networks: [cortex-net]
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - cortex-net
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant-data:/qdrant/storage
+    ports:
+      - "6333:6333"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cortex-net
+
+  # ── Observability ─────────────────────────────────────────────────────────
+
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    ports:
+      - "6006:6006"
+    volumes:
+      - phoenix-data:/root/.phoenix
+    networks:
+      - cortex-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./obs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+    ports:
+      - "9090:9090"
+    networks:
+      - cortex-net
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: cortex
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/cortex.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./obs/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./obs/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - cortex-net
+
+volumes:
+  redis-data:
+  qdrant-data:
+  phoenix-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  cortex-net:
+    driver: bridge
