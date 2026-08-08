@@ -41,6 +41,7 @@ from cortex.obs.metrics import (
     api_requests_total,
     configure_observability,
 )
+from cortex.safety.middleware import SafetyMiddleware
 
 configure_logging()
 logger = get_logger(__name__)
@@ -155,14 +156,32 @@ class MCPCallRequest(BaseModel):
 
 
 async def _execute_run(run_id: str, request: RunRequest, user: TokenPayload) -> None:
-    """Execute an agent run in the background and store result."""
+    """Execute an agent run in the background and store result.
+
+    The safety layer is applied HERE, on the goal going in and the answer
+    coming out. It was fully implemented - injection detection, PII
+    redaction, NeMo rails - and referenced by nothing: `grep -rn safety
+    src/` outside the safety package itself returned a metric name and an
+    exception class. Every request went straight to the graph.
+
+    Third occurrence of the same defect class in this codebase (the MCP
+    client, the rate-limit setting, and now the whole guardrail layer), so
+    it is worth naming the smell: a module with a clean interface, thorough
+    tests, and no inbound call edge from production code.
+    """
+    safety = SafetyMiddleware()
     try:
+        goal = await safety.check_input(request.goal, user_id=user.sub)
         state = await run_cortex(
-            user_goal=request.goal,
+            user_goal=goal,
             user_id=user.sub,
             session_id=request.session_id,
             context=request.context,
         )
+        if state.final_output:
+            state = state.model_copy(
+                update={"final_output": await safety.check_output(state.final_output)}
+            )
         _runs[run_id] = state
     except Exception as exc:
         logger.error("run.background_error", run_id=run_id, error=str(exc))

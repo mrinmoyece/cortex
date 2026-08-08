@@ -92,3 +92,59 @@ INJECTION_DETECTION_ENABLED=false
 ```
 
 Never disable safety in production.
+
+
+## The layers, and what each is actually worth
+
+```
+input   →  scored jailbreak detection  (local, µs)  →  [classifier, optional]
+        →  PII redaction               (Presidio)
+        →  NeMo Colang rails           (optional)
+
+tool    →  spotlighting                (local, µs)   ← indirect injection
+output  →  harm pattern matching       (local, µs)  →  [classifier, optional]
+        →  PII redaction               (Presidio)
+```
+
+**Scored, not matched.** Jailbreak detection assigns weights to signals and
+sums them. A single strong signal (instruction override, named jailbreak,
+injected control token) blocks alone; a single weak one (persona swap) does
+not, because refusing "pretend you are a pirate" is how a safety layer gets
+switched off. Two weak signals together block.
+
+The weights were guessed first, and the corpus caught it: a bare "ignore
+all previous instructions" scored 0.45 against a 0.50 threshold and was
+**allowed**. Nothing else in that prompt was suspicious, so no second signal
+arrived. Anything strong enough to block on its own must exceed the
+threshold on its own — obvious in hindsight, invisible without the test.
+
+**Two normalisations, because neither is sufficient.** A zero-width space
+*inside* a word (`Ig<ZWSP>nore`) is defeated by deleting invisibles; a bidi
+override *between* words (`ignore<RLO>previous`) is defeated by replacing
+them with spaces. Each fix breaks the other case, so both readings are
+scored and the higher wins. An attacker has to beat every normalisation
+rather than find the one that was skipped.
+
+**Spotlighting for indirect injection.** Tool results and prior task
+outputs are fenced and labelled as data before entering the prompt. This is
+the attack that matters for a RAG agent: direct injection needs a hostile
+user, indirect injection needs one poisoned document in a corpus the user
+trusts — and the agent reads it with the user's privileges. Spotlighting
+does not make injection impossible; it makes the boundary explicit, which
+is the difference between an attack needing persuasion and needing nothing.
+
+**The classifier layer fails CLOSED.** The semantic cache fails open,
+because a cache is an optimisation. A moderator is a control, and quietly
+serving unmoderated output because a dependency blipped is exactly the
+incident the layer exists to prevent.
+
+## Honest scope
+
+- Regex and scoring beat obvious and lightly-paraphrased attacks. A
+  determined attacker beats them. The classifier seam exists for that, and
+  is unconfigured by default.
+- 13 attack strings and 10 benign controls in `tests/test_safety/`. Both
+  directions are tested, because tuning only for recall produces a layer
+  with false positives that somebody disables within a week.
+- No output moderation existed at all before this. Input was filtered and
+  PII redacted; nothing examined what the model said.

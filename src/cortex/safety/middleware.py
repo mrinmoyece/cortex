@@ -19,6 +19,7 @@ from cortex.config import settings
 from cortex.exceptions import PromptInjectionError
 from cortex.logging_config import get_logger
 from cortex.obs.metrics import safety_violations_total
+from cortex.safety.moderation import ModerationError, get_moderator
 
 logger = get_logger(__name__)
 
@@ -163,6 +164,19 @@ class SafetyMiddleware:
         if not settings.guardrails_enabled:
             return text
 
+        # Scored jailbreak detection runs first: it covers paraphrase that
+        # the regex layer below cannot, and it is the cheaper of the two to
+        # fail on.
+        verdict = await get_moderator().check_input(text)
+        if not verdict.allowed:
+            logger.warning(
+                "safety.jailbreak_blocked",
+                user_id=user_id,
+                score=verdict.score,
+                reason=verdict.reason,
+            )
+            raise PromptInjectionError(f"Input refused by the moderation layer: {verdict.reason}")
+
         # 1. Injection check
         if self._injection:
             matches = self._injection.scan(text)
@@ -191,6 +205,19 @@ class SafetyMiddleware:
         """
         if not settings.guardrails_enabled:
             return text
+
+        # Nothing used to look at what the model actually SAID - input was
+        # filtered and PII redacted, but no control examined the output.
+        # That is the wrong way round if you can only afford one: prompt
+        # injection is a means, harmful output is the end.
+        verdict = await get_moderator().check_output(text)
+        if not verdict.allowed:
+            logger.warning(
+                "safety.output_blocked",
+                categories=[c.value for c in verdict.categories],
+                reason=verdict.reason,
+            )
+            raise ModerationError(f"Response withheld: {verdict.reason}")
 
         # PII redaction on output
         if self._pii:
