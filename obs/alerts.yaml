@@ -1,0 +1,68 @@
+groups:
+  - name: cortex.rules
+    rules:
+
+      # ── Cost alerts ──────────────────────────────────────────────────────────
+      - alert: CortexHighCostPerRun
+        expr: increase(cortex_llm_cost_usd_total[1h]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM spend exceeding $10/hour"
+          description: "Total LLM cost in the last hour: {{ $value | printf \"%.2f\" }} USD"
+
+      # ── Latency alerts ────────────────────────────────────────────────────────
+      - alert: CortexHighLLMLatency
+        expr: histogram_quantile(0.95, rate(cortex_llm_request_duration_seconds_bucket[5m])) > 15
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 LLM latency > 15s"
+          description: "p95 LLM latency is {{ $value | printf \"%.1f\" }}s on model {{ $labels.model }}"
+
+      - alert: CortexHighRunLatency
+        expr: histogram_quantile(0.95, rate(cortex_agent_run_duration_seconds_bucket[10m])) > 120
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 agent run duration > 2 minutes"
+
+      # ── Quality alerts ────────────────────────────────────────────────────────
+      - alert: CortexLowHallucinationScore
+        expr: histogram_quantile(0.5, rate(cortex_hallucination_score_bucket[30m])) < 0.75
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Median faithfulness score below 0.75"
+          description: "Median hallucination/faithfulness score: {{ $value | printf \"%.2f\" }}"
+
+      - alert: CortexHighCriticRejectionRate
+        expr: rate(cortex_critic_rejections_total[15m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Critic rejecting more than 50% of outputs"
+
+      # ── Error alerts ──────────────────────────────────────────────────────────
+      - alert: CortexHighAgentFailureRate
+        expr: rate(cortex_agent_runs_total{status="failed"}[10m]) / rate(cortex_agent_runs_total[10m]) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than 10% of agent runs failing"
+          description: "Failure rate: {{ $value | humanizePercentage }}"
+
+      - alert: CortexSafetyViolationSpike
+        expr: increase(cortex_safety_violations_total[5m]) > 10
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Safety violation spike detected"
+          description: "{{ $value }} violations in 5 minutes. Type: {{ $labels.violation_type }}"
