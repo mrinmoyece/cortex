@@ -1,0 +1,52 @@
+[
+  {
+    "question": "What are the main benefits of using MCP for tool exposure?",
+    "answer": "MCP provides native LLM client compatibility, standardised tool discovery, and composability with other MCP servers. Any MCP-compatible client can connect without custom integration code.",
+    "contexts": [
+      "Model Context Protocol (MCP) is the protocol adopted by Anthropic, OpenAI, and major IDE vendors for exposing AI tools. MCP clients automatically discover available tools, their schemas, and descriptions.",
+      "Cortex exposes all its capabilities as MCP tools. Any MCP-compatible client such as Claude Desktop or VS Code can connect and use the platform as a toolbox.",
+      "MCP allows Cortex to act as both a server (exposing tools) and a client (consuming tools from other MCP servers like GitHub, Jira, and Slack)."
+    ],
+    "ground_truth": "MCP enables native LLM client compatibility, automatic tool discovery, and the ability to compose tools from multiple MCP servers without custom integration work."
+  },
+  {
+    "question": "How does the three-tier memory system work?",
+    "answer": "Cortex uses working memory (in-process, single run), episodic memory (Redis, past 7 days of run summaries), and semantic memory (Qdrant vectors, permanent fact storage). At run start, relevant context is retrieved from all tiers. At run end, the run summary is persisted to episodic and extracted facts go to semantic.",
+    "contexts": [
+      "Working memory holds current context in-process and is token-budget aware. Episodic memory stores run summaries in Redis with a 7-day TTL. Semantic memory stores extracted facts in Qdrant as vectors.",
+      "At run start, the MemoryAgent retrieves relevant episodic summaries (last 5 sessions) and semantically similar facts (top 10 by embedding similarity) and injects them into the agent context.",
+      "At run end, the MemoryAgent writes a run summary to episodic store and extracts up to 5 facts from task results into the semantic store."
+    ],
+    "ground_truth": "Three-tier memory uses working memory for single-run context, Redis for recent session history, and Qdrant for permanent fact retrieval. Each tier serves a different temporal scope."
+  },
+  {
+    "question": "What happens when the LLM budget is exceeded during a run?",
+    "answer": "The LLM router checks the current run cost from Redis before every LLM call. If the accumulated cost exceeds the configured MAX_COST_PER_RUN_USD limit, it raises LLMBudgetExceededError and the run transitions to FAILED status.",
+    "contexts": [
+      "The LLMRouter checks the Redis cost ledger before every LLM call. If the run has already spent more than max_cost_per_run_usd, it raises LLMBudgetExceededError.",
+      "Cost is tracked per-run in Redis using a list of CostEntry records. The CostTracker.get_run_cost() method sums all entries to return the total USD spent in that run.",
+      "The graph routing function checks total_cost_usd against the budget limit and routes to end_failed if exceeded."
+    ],
+    "ground_truth": "When the cost ceiling is reached, LLMBudgetExceededError is raised before the next LLM call is made, and the graph transitions the run to FAILED status."
+  },
+  {
+    "question": "How does hybrid search improve RAG retrieval quality?",
+    "answer": "Hybrid search combines dense vector search (embedding similarity) and sparse BM25 lexical search, then fuses them with Reciprocal Rank Fusion (RRF). This captures both semantic similarity and exact keyword matches. A Cohere reranker then applies cross-encoder precision to the top candidates.",
+    "contexts": [
+      "The RAG pipeline performs parallel dense search via Qdrant and sparse search via BM25Okapi, then merges results using Reciprocal Rank Fusion with k=60.",
+      "Dense search captures semantic similarity — it finds conceptually related documents even when the exact words differ. Sparse BM25 captures lexical matches — it excels when exact terms or named entities matter.",
+      "After RRF fusion, a Cohere reranker applies cross-encoder scoring to the top candidates, improving precision at the cost of additional latency."
+    ],
+    "ground_truth": "Hybrid search combines semantic (dense) and lexical (sparse) signals, fused with RRF, then reranked with a cross-encoder for maximum precision."
+  },
+  {
+    "question": "What does the critic agent do when it rejects output?",
+    "answer": "When the critic rejects output, it provides a CritiqueResult with suggestions. The graph routes back to the planner with the critique context injected. The planner rebuilds the task list incorporating the suggestions. This loop continues for up to max_critique_iterations.",
+    "contexts": [
+      "The critic scores output on faithfulness, completeness, and coherence. If overall score < 0.80 or faithfulness < 0.85, the output is rejected.",
+      "On rejection, the graph transitions status back to PLANNING. The critique_results list and critique_iteration counter are updated. The tasks list is cleared so the planner builds a fresh plan.",
+      "The planner agent checks for critique context in the state and injects the rejection reasoning and suggestions into its planning prompt when replanning."
+    ],
+    "ground_truth": "A critic rejection triggers replanning: the critique suggestions are injected into the planner's next prompt, tasks are cleared, and the executor runs again. This loops up to max_critique_iterations times."
+  }
+]
