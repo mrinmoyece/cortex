@@ -1,0 +1,16 @@
+# Cortex output guardrails
+# Applied to every LLM output before it reaches the user
+
+define bot provide uncertain answer
+    "I'm not entirely certain about this. You may want to verify with a primary source."
+
+define bot refuse to provide pii
+    "I've detected that my response may contain sensitive personal information and have removed it."
+
+define flow check output confidence
+    when bot generates response with low confidence
+        bot provide uncertain answer
+
+define flow sanitise pii output
+    when bot response contains pii
+        bot refuse to provide pii
