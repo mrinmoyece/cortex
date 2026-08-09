@@ -26,7 +26,7 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from cortex.config import settings
-from cortex.graph.state import CortexState, MemoryContext
+from cortex.graph.state import CortexState, MemoryContext, RunStatus
 from cortex.logging_config import get_logger
 from cortex.obs.tracing import observe
 
@@ -43,6 +43,7 @@ logger = get_logger(__name__)
 # Defence in depth, not paranoia: the isolation now holds even if two
 # tenants issue the same user id, and a key prefix is a cheap place to
 # enforce it.
+_EPISODIC_KEY_PREFIX = "cortex:episodic:"
 _EPISODIC_KEY = "cortex:episodic:{tenant_id}:{user_id}"
 _EPISODIC_MEMBER_KEY = "cortex:episodic:{tenant_id}:{user_id}:{session_id}"
 DEFAULT_TENANT = "default"
@@ -244,6 +245,30 @@ class SemanticMemory:
         return [{"content": r.payload["content"], "score": r.score, **r.payload} for r in results]
 
 
+def _facts_from_episode(episode: dict) -> list[dict]:
+    """Derive durable facts from a settled run summary.
+
+    Structured fields only - never the free-form output. Memorising model
+    prose is how a memory system becomes a hallucination amplifier: one
+    confident wrong claim gets written down and then retrieved as fact
+    forever.
+    """
+    if episode.get("status") != RunStatus.COMPLETED.value:
+        # A failed run's conclusions are not facts.
+        return []
+    goal = (episode.get("goal") or "").strip()
+    summary = (episode.get("output_summary") or "").strip()
+    if not goal or not summary:
+        return []
+    return [
+        {
+            "content": f"Asked: {goal[:200]} - concluded: {summary[:400]}",
+            "source": f"run:{episode.get('run_id', 'unknown')}",
+            "entity_type": "run_conclusion",
+        }
+    ]
+
+
 # ── Memory Agent ───────────────────────────────────────────────────────────────
 
 
@@ -307,6 +332,67 @@ class MemoryAgent:
             run_id=state.run_id,
             facts_stored=len(facts),
         )
+
+    async def sweep_stale(self, older_than_seconds: float = 3600.0, limit: int = 100) -> int:
+        """Promote settled episodes into semantic memory. Returns the count.
+
+        Episodic memory is a recency log with a TTL; semantic memory is
+        durable. Without a sweep, anything not consolidated at the end of
+        its own run simply expires - so a run that crashed after producing
+        useful facts loses them, and the agent never learns from exactly
+        the runs most worth learning from.
+
+        `older_than_seconds` exists so the sweep never touches an episode
+        that a live run might still be writing to. An hour is far beyond
+        any run's lifetime and cheap to be wrong about in the safe
+        direction.
+        """
+        redis = await self.episodic._get_redis()
+        cutoff = time.time() - older_than_seconds
+        promoted = 0
+
+        # The index (a sorted set) and the payloads (strings) share a key
+        # prefix, so a bare `KEYS cortex:episodic:*` returns both and
+        # `ZRANGEBYSCORE` on a payload raises WRONGTYPE. Filtering on
+        # structure rather than calling TYPE on every key avoids a round
+        # trip per key on a store that may hold thousands.
+        #
+        #   index:   cortex:episodic:{tenant}:{user}            - 3 colons
+        #   payload: cortex:episodic:{tenant}:{user}:{session}  - 4 colons
+        index_keys = [k for k in await redis.keys(f"{_EPISODIC_KEY_PREFIX}*") if k.count(":") == 3]
+        for key in index_keys:
+            # Sorted by timestamp, so this asks Redis for exactly the
+            # settled members rather than fetching everything and
+            # filtering in Python.
+            members = await redis.zrangebyscore(key, "-inf", cutoff, start=0, num=limit)
+            for member_key in members:
+                raw = await redis.get(member_key)
+                if raw is None:
+                    # The member outlived its payload: the TTL expired but
+                    # the index entry did not. Drop the dangling pointer,
+                    # or it is rescanned on every sweep forever.
+                    await redis.zrem(key, member_key)
+                    continue
+                episode = json.loads(raw)
+                if episode.get("consolidated"):
+                    continue
+                facts = _facts_from_episode(episode)
+                if facts:
+                    _, tenant_id, user_id = key.rsplit(":", 2)[-3:]
+                    await self.semantic.store_facts(facts, user_id, tenant_id=tenant_id)
+                    promoted += len(facts)
+                # Marked rather than deleted: the episode is still valid
+                # recency context, and re-promoting it every hour would
+                # duplicate the same facts indefinitely.
+                episode["consolidated"] = True
+                await redis.set(
+                    member_key,
+                    json.dumps(episode),
+                    keepttl=True,
+                )
+
+        logger.info("memory.sweep_complete", facts_promoted=promoted)
+        return promoted
 
     def _extract_facts(self, state: CortexState) -> list[dict]:
         """Simple heuristic fact extraction — replace with LLM extraction in prod."""

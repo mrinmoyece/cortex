@@ -151,12 +151,26 @@ def run_eval_regression() -> dict[str, Any]:
     name="cortex.workers.celery_app.consolidate_stale_memory",
 )
 def consolidate_stale_memory() -> dict[str, Any]:
+    """Promote settled episodes into semantic memory.
+
+    This was a placeholder that logged a line and returned
+    `{"consolidated": 0}` - scheduled hourly, registered in the beat
+    schedule, tested for registration, and doing nothing. A cron entry that
+    always reports success is worse than an absent one: the dashboard shows
+    a healthy job and the work never happens.
+
+    What it does now: episodes older than an hour that were never
+    consolidated at the end of their own run are swept into semantic
+    memory. Those are exactly the runs worth learning from - the ones that
+    crashed, timed out, or were interrupted after producing useful output.
+    Without the sweep their facts expire with the episodic TTL and the
+    agent never learns from them.
     """
-    Placeholder for memory consolidation job.
-    In production: scan episodic store for episodes ready for semantic extraction.
-    """
-    logger.info("Memory consolidation tick — no stale sessions in this cycle")
-    return {"consolidated": 0}
+    from cortex.agents.memory_agent import MemoryAgent
+
+    promoted = _run_async(MemoryAgent().sweep_stale())
+    logger.info(f"Memory consolidation: promoted {promoted} fact(s)")
+    return {"consolidated": promoted}
 
 
 def run() -> None:

@@ -137,3 +137,91 @@ class TestTenantIsolation:
     async def test_a_tenant_with_no_history_sees_nothing(self, memory):
         await memory.store(user_id="u", session_id="s", summary={"x": 1}, tenant_id="acme")
         assert await memory.retrieve_recent("u", limit=10, tenant_id="other") == []
+
+
+class TestStaleSweep:
+    """`consolidate_stale_memory` was a placeholder: scheduled hourly,
+    registered in the beat schedule, tested for registration, and returning
+    `{"consolidated": 0}` unconditionally. A cron entry that always reports
+    success is worse than an absent one - the dashboard shows a healthy job
+    and the work never happens."""
+
+    @pytest.fixture
+    def agent(self):
+        from unittest.mock import AsyncMock
+
+        from cortex.agents.memory_agent import MemoryAgent
+
+        a = MemoryAgent()
+        a.episodic._redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        a.semantic.store_facts = AsyncMock()
+        return a
+
+    async def _store(self, agent, *, age_seconds: float, status="completed", **extra):
+        import time as _time
+
+        summary = {
+            "run_id": "r1",
+            "goal": "what is the refund window",
+            "status": status,
+            "output_summary": "Refunds are accepted within 30 days.",
+            **extra,
+        }
+        await agent.episodic.store(user_id="u", session_id="s", summary=summary, tenant_id="acme")
+        # Backdate the sorted-set score so the episode reads as settled.
+        redis = agent.episodic._redis
+        for key in await redis.keys("cortex:episodic:*"):
+            if await redis.type(key) == "zset":
+                for member in await redis.zrange(key, 0, -1):
+                    await redis.zadd(key, {member: _time.time() - age_seconds})
+
+    @pytest.mark.asyncio
+    async def test_settled_episodes_are_promoted(self, agent):
+        await self._store(agent, age_seconds=7200)
+        assert await agent.sweep_stale(older_than_seconds=3600) == 1
+        agent.semantic.store_facts.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recent_episodes_are_left_alone(self, agent):
+        """A live run may still be writing to its episode."""
+        await self._store(agent, age_seconds=10)
+        assert await agent.sweep_stale(older_than_seconds=3600) == 0
+        agent.semantic.store_facts.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_run_contributes_no_facts(self):
+        """A failed run's conclusions are not facts."""
+        from cortex.agents.memory_agent import _facts_from_episode
+
+        assert _facts_from_episode({"status": "failed", "goal": "g", "output_summary": "s"}) == []
+
+    @pytest.mark.asyncio
+    async def test_promotion_happens_once_not_every_hour(self, agent):
+        """Without a marker the sweep re-promotes the same episode hourly
+        and semantic memory fills with duplicates of one run."""
+        await self._store(agent, age_seconds=7200)
+        assert await agent.sweep_stale(older_than_seconds=3600) == 1
+        assert await agent.sweep_stale(older_than_seconds=3600) == 0
+
+    @pytest.mark.asyncio
+    async def test_the_tenant_is_preserved_through_promotion(self, agent):
+        """Losing the tenant here would move a private fact into the shared
+        default tenant - a cross-tenant leak committed by a cleanup job."""
+        await self._store(agent, age_seconds=7200)
+        await agent.sweep_stale(older_than_seconds=3600)
+        assert agent.semantic.store_facts.await_args.kwargs["tenant_id"] == "acme"
+
+    @pytest.mark.asyncio
+    async def test_a_dangling_index_entry_is_cleaned_up(self, agent):
+        """The member's payload can expire while its index entry survives.
+        Left in place it is rescanned forever."""
+        await self._store(agent, age_seconds=7200)
+        redis = agent.episodic._redis
+        for key in await redis.keys("cortex:episodic:*"):
+            if await redis.type(key) == "string":
+                await redis.delete(key)
+
+        assert await agent.sweep_stale(older_than_seconds=3600) == 0
+        for key in await redis.keys("cortex:episodic:*"):
+            if await redis.type(key) == "zset":
+                assert await redis.zcard(key) == 0, "dangling pointer was not removed"
