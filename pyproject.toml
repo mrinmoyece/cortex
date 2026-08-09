@@ -79,8 +79,17 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
     "pytest-mock>=3.14.0",
+    # Used by every storage test. It was undeclared, so the suite passed
+    # locally (where it had been pip-installed by hand) and would have
+    # failed on a clean CI runner at import time - the classic "works on my
+    # machine" left in a dependency list.
+    "fakeredis>=2.26.0",
     "httpx>=0.27.0",
     "respx>=0.21.0",
+    # Imported directly by tests. Transitive today via fastapi and the
+    # metrics layer; a direct import deserves a direct declaration, or an
+    # unrelated upgrade silently breaks the suite.
+    "starlette>=0.41.0",
     "factory-boy>=3.3.0",
     "ruff>=0.7.0",
     "mypy>=1.13.0",
