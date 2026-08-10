@@ -7,24 +7,49 @@ the cached response without touching the LLM.
 
 This cuts costs significantly for high-traffic deployments where users
 ask semantically equivalent questions.
+
+Two properties matter more than the hit rate:
+
+1. **The embedded text is the prompt.** The original implementation
+   embedded `sha256(f"{model}:{messages}")` - a 64-character hex digest.
+   Cosine similarity between two hex digests is noise, so the cache was
+   neither semantic nor safe: near-identical prompts missed, and unrelated
+   prompts could clear a 0.95 threshold and return someone else's answer.
+2. **Every lookup is scoped.** A hit is only served if it was produced by
+   the same model *and* the same tenant. Similarity alone is not
+   authorisation.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
+import uuid
+from typing import Any
 
 import litellm
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 from cortex.config import settings
 from cortex.logging_config import get_logger
+from cortex.obs.metrics import llm_cache_hits_total
 
 logger = get_logger(__name__)
 
 _CACHE_COLLECTION = "cortex_llm_cache"
 _CACHE_TTL_SECONDS = 3600 * 24  # 24 hours
+#: Embedding providers reject oversized inputs, and a prompt long enough to
+#: hit this is not one whose exact tail decides semantic equivalence.
+_MAX_EMBED_CHARS = 8_000
 
 
 class SemanticCache:
@@ -59,35 +84,50 @@ class SemanticCache:
     async def _embed(self, text: str) -> list[float]:
         response = await litellm.aembedding(
             model=settings.embedding_model,
-            input=[text],
+            input=[text[:_MAX_EMBED_CHARS]],
         )
-        return response.data[0]["embedding"]
+        embedding: list[float] = response.data[0]["embedding"]
+        return embedding
 
-    async def get(self, cache_key: str) -> litellm.ModelResponse | None:
-        """Return cached response if a semantically similar prompt exists."""
+    @staticmethod
+    def _scope_filter(*, model: str, scope: str) -> Filter:
+        """Similarity is not authorisation - a hit must match model and tenant."""
+        return Filter(
+            must=[
+                FieldCondition(key="model", match=MatchValue(value=model)),
+                FieldCondition(key="scope", match=MatchValue(value=scope)),
+            ]
+        )
+
+    async def get(self, prompt: str, *, model: str, scope: str) -> litellm.ModelResponse | None:
+        """Return a cached response for a semantically similar *scoped* prompt."""
         try:
             client = await self._ensure_collection()
-            vector = await self._embed(cache_key)
+            vector = await self._embed(prompt)
 
-            results = await client.search(
+            response = await client.query_points(
                 collection_name=_CACHE_COLLECTION,
-                query_vector=vector,
+                query=vector,
+                query_filter=self._scope_filter(model=model, scope=scope),
                 limit=1,
                 score_threshold=settings.semantic_cache_similarity_threshold,
+                with_payload=True,
             )
+            results = response.points
 
             if not results:
                 return None
 
             hit = results[0]
-            payload = hit.payload or {}
+            payload: dict[str, Any] = hit.payload or {}
 
             # Check TTL
             if time.time() - payload.get("created_at", 0) > _CACHE_TTL_SECONDS:
                 logger.debug("cache.expired", score=hit.score)
                 return None
 
-            logger.info("cache.hit", score=f"{hit.score:.3f}")
+            logger.info("cache.hit", score=f"{hit.score:.3f}", model=model)
+            llm_cache_hits_total.labels(model=model).inc()
             return litellm.ModelResponse(**json.loads(payload["response_json"]))
 
         except Exception as exc:
@@ -95,13 +135,13 @@ class SemanticCache:
             logger.warning("cache.get_failed", error=str(exc))
             return None
 
-    async def set(self, cache_key: str, response: litellm.ModelResponse) -> None:
+    async def set(
+        self, prompt: str, response: litellm.ModelResponse, *, model: str, scope: str
+    ) -> None:
         """Store an LLM response in the semantic cache."""
         try:
             client = await self._ensure_collection()
-            vector = await self._embed(cache_key)
-
-            import uuid
+            vector = await self._embed(prompt)
 
             point_id = str(uuid.uuid4())
             await client.upsert(
@@ -113,7 +153,12 @@ class SemanticCache:
                         payload={
                             "response_json": response.model_dump_json(),
                             "created_at": time.time(),
-                            "cache_key_prefix": cache_key[:64],
+                            "model": model,
+                            "scope": scope,
+                            # The prompt itself is deliberately not stored:
+                            # the cache would otherwise become an unbounded,
+                            # unaudited copy of every prompt users send.
+                            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                         },
                     )
                 ],

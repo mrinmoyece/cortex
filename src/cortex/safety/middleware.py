@@ -28,32 +28,41 @@ logger = get_logger(__name__)
 
 
 class PIIScanner:
-    """
-    Uses Microsoft Presidio to detect and redact PII.
-    Falls back to regex-only detection if Presidio isn't installed.
+    """Detect and redact PII.
+
+    Presidio and the regex patterns run *together*, not as alternatives.
+    The original code treated them as an either/or fallback, which quietly
+    made detection worse when Presidio was installed: Presidio's English
+    configuration does not register `CreditCardRecognizer` and has no UK
+    National Insurance recogniser at all, so installing the "better" engine
+    silently stopped redacting card numbers and NINOs that the regex
+    fallback had been catching.
+
+    Presidio is also restricted to a configured allowlist of high-confidence
+    identifiers. Its defaults flag DATE_TIME, PERSON, LOCATION and URL, so
+    "the annual report" was being rewritten to "the <DATE_TIME> report" -
+    a false positive that destroys the user's goal before an agent sees it,
+    which is a worse failure than missing PII.
     """
 
     def __init__(self) -> None:
         self._analyzer: Any = None
-        self._anonymizer: Any = None
         self._presidio_available = False
         self._init()
 
     def _init(self) -> None:
         try:
             from presidio_analyzer import AnalyzerEngine
-            from presidio_anonymizer import AnonymizerEngine
 
             self._analyzer = AnalyzerEngine()
-            self._anonymizer = AnonymizerEngine()
             self._presidio_available = True
             logger.info("pii.presidio_loaded")
         except ImportError:
-            logger.warning("pii.presidio_not_available — using regex fallback")
+            logger.warning("pii.presidio_not_available - using regex patterns only")
 
-    # Compiled regex patterns for common PII (fallback)
+    # Compiled regex patterns for PII Presidio does not cover for English.
     _PATTERNS: ClassVar[dict[str, re.Pattern[str]]] = {
-        "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
+        "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
         "phone_uk": re.compile(r"\b(?:\+44|0)[\d\s]{9,12}\b"),
         "phone_us": re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b"),
         "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
@@ -61,33 +70,55 @@ class PIIScanner:
         "nino": re.compile(r"\b[A-Z]{2}\d{6}[A-D]\b"),  # UK National Insurance
     }
 
-    def scan(self, text: str) -> list[dict]:
-        """Return list of detected PII entities."""
-        if self._presidio_available:
-            results = self._analyzer.analyze(text=text, language="en")
-            return [
-                {"type": r.entity_type, "start": r.start, "end": r.end, "score": r.score}
-                for r in results
-            ]
+    def _presidio_spans(self, text: str) -> list[dict[str, Any]]:
+        if not self._presidio_available:
+            return []
+        entities = list(settings.pii_entities)
+        threshold = float(settings.pii_score_threshold)
+        try:
+            results = self._analyzer.analyze(text=text, language="en", entities=entities)
+        except Exception:  # pragma: no cover - engine-internal failure
+            logger.warning("pii.presidio_analyze_failed", exc_info=True)
+            return []
+        return [
+            {"type": r.entity_type, "start": r.start, "end": r.end, "score": r.score}
+            for r in results
+            if r.score >= threshold
+        ]
 
-        # Regex fallback
-        found = []
+    def _regex_spans(self, text: str) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
         for pii_type, pattern in self._PATTERNS.items():
             for m in pattern.finditer(text):
                 found.append({"type": pii_type, "start": m.start(), "end": m.end(), "score": 0.8})
         return found
 
+    @staticmethod
+    def _merge(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop spans overlapping an already-accepted, longer/stronger span.
+
+        Two engines finding the same phone number must produce one
+        redaction, not a redaction nested inside a redaction.
+        """
+        ordered = sorted(spans, key=lambda s: (-(s["end"] - s["start"]), -s["score"], s["start"]))
+        kept: list[dict[str, Any]] = []
+        for span in ordered:
+            if any(span["start"] < k["end"] and k["start"] < span["end"] for k in kept):
+                continue
+            kept.append(span)
+        return sorted(kept, key=lambda s: s["start"])
+
+    def scan(self, text: str) -> list[dict[str, Any]]:
+        """Return detected PII entities, from both engines, de-overlapped."""
+        return self._merge(self._presidio_spans(text) + self._regex_spans(text))
+
     def redact(self, text: str) -> str:
         """Replace PII with type placeholders."""
-        if self._presidio_available:
-            results = self._analyzer.analyze(text=text, language="en")
-            anonymized = self._anonymizer.anonymize(text=text, analyzer_results=results)
-            return anonymized.text
-
-        # Regex fallback
+        spans = self.scan(text)
         redacted = text
-        for pii_type, pattern in self._PATTERNS.items():
-            redacted = pattern.sub(f"[{pii_type.upper()}_REDACTED]", redacted)
+        for span in reversed(spans):
+            placeholder = f"[{str(span['type']).upper()}_REDACTED]"
+            redacted = redacted[: span["start"]] + placeholder + redacted[span["end"] :]
         return redacted
 
 

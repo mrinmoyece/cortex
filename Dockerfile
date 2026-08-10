@@ -30,11 +30,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd -r cortex && useradd -r -g cortex cortex
 WORKDIR /app
 COPY --from=builder /install /usr/local
-COPY src/ src/
+# The package is installed into /usr/local by the builder stage; copying the
+# sources again would shadow it with an uninstalled tree. Only the runtime
+# data files are needed here.
 COPY config/ config/
+
+# /tmp is the one writable path the app needs when the filesystem is mounted
+# read-only (as it is in deploy/k8s).
+RUN chown -R cortex:cortex /app
 
 USER cortex
 EXPOSE 8000 8001
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
+
+# Without this the image has no default process: `docker run cortex` exits
+# immediately, and every compose service had to name a command by hand.
+CMD ["cortex-api"]

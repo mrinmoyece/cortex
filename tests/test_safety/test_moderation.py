@@ -282,7 +282,9 @@ class TestSafetyIsOnTheRunPath:
             await _execute_run("r-block", request, user)
 
         graph.assert_not_awaited(), "a refused goal must not start a run"
-        assert _runs["r-block"].status.value == "failed"
+        run = _runs.get("r-block")
+        assert run is not None, "a refused goal must record a failed run"
+        assert run.status.value == "failed"
 
     @pytest.mark.asyncio
     async def test_an_ordinary_goal_still_runs(self):
@@ -336,5 +338,7 @@ class TestSafetyIsOnTheRunPath:
         with patch("cortex.api.main.run_cortex", new_callable=AsyncMock, return_value=harmful):
             await _execute_run("r-harm", RunRequest(goal="chemistry question"), user)
 
-        assert _runs["r-harm"].status.value == "failed"
-        assert "bomb" not in (_runs["r-harm"].final_output or "")
+        run = _runs.get("r-harm")
+        assert run is not None, "a blocked output must record a failed run"
+        assert run.status.value == "failed"
+        assert "bomb" not in (run.final_output or "")

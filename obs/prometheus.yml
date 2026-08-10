@@ -5,6 +5,7 @@ global:
     service: cortex
     environment: local
 
+# Mounted from obs/alerts.yaml by docker-compose.
 rule_files:
   - /etc/prometheus/alerts.yml
 
@@ -14,10 +15,12 @@ scrape_configs:
       - targets: ["cortex-api:8000"]
     metrics_path: /metrics
     scrape_interval: 10s
-
-  - job_name: redis
-    static_configs:
-      - targets: ["redis:9121"]
+    # /metrics is unauthenticated unless METRICS_TOKEN is set. If you set it,
+    # uncomment this and mount the same value as a file, otherwise every
+    # scrape returns 401 and the dashboards go blank without warning.
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/metrics_token
 
   - job_name: qdrant
     static_configs:

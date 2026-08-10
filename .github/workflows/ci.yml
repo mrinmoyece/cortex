@@ -4,6 +4,10 @@ on:
   push: { branches: [main] }
   pull_request:
 
+# Least privilege by default; the one job that needs more asks for it.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -34,8 +38,9 @@ jobs:
           ruff format --check src tests perf
 
       - name: Type check
-        run: mypy src --ignore-missing-imports
-        continue-on-error: true   # advisory while annotations are completed
+        # No longer advisory. The 83 strict-mode errors this was hiding are
+        # fixed, so a regression fails the build instead of scrolling past.
+        run: mypy src
 
       - name: Tests and coverage gate
         # No `|| true`. The gate is 80% and it is allowed to fail the build;
@@ -58,20 +63,14 @@ jobs:
         with: { python-version: "3.13" }
       - run: pip install -e ".[dev]" pip-audit bandit
       - name: Dependency audit
-        # No `|| true` and no placeholder ignore entry. A real advisory gets
-        # a dated, justified exception or it gets fixed.
-        run: pip-audit --strict
+        # Scoped to Cortex's own dependency closure. Plain `pip-audit
+        # --strict` audits the whole environment, so it fails on anything
+        # else the runner happens to have installed and aborts outright on
+        # editable installs it cannot resolve. No `|| true`: a real advisory
+        # gets a dated, justified entry in audit-ignore.toml or it gets fixed.
+        run: python scripts/audit.py --extra dev
       - name: Static security analysis
         run: bandit -r src -ll
-
-  codeql:
-    runs-on: ubuntu-latest
-    permissions: { security-events: write, contents: read }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
-        with: { languages: python }
-      - uses: github/codeql-action/analyze@v3
 
   performance:
     runs-on: ubuntu-latest

@@ -11,9 +11,13 @@ venv/
 .ruff_cache/
 .mypy_cache/
 .coverage
+.deepeval
 coverage.xml
 htmlcov/
 .DS_Store
 .idea/
 .vscode/
 *.db
+
+# Written and removed by scripts/audit.py
+.audit-requirements.txt

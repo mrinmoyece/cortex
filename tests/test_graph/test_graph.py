@@ -125,10 +125,15 @@ class TestGraphAssembly:
         for expected in ("load_memory", "planner", "executor", "critic", "save_memory"):
             assert expected in nodes, f"{expected} missing from {sorted(nodes)}"
 
-    def test_it_interrupts_before_the_critic_for_human_review(self):
-        """Human-in-the-loop is a headline claim; without the interrupt it
-        is just a comment."""
+    def test_human_review_is_off_by_default(self):
+        """The graph used to interrupt before the critic unconditionally with
+        no resume endpoint anywhere, so every run silently stopped half-done
+        and reported success. Suspension has to be opt-in."""
         g = build_graph()
+        assert "critic" not in g.interrupt_before_nodes
+
+    def test_human_review_can_be_enabled_explicitly(self):
+        g = build_graph(human_review=True)
         assert "critic" in g.interrupt_before_nodes
 
     def test_a_checkpointer_is_attached_so_runs_can_resume(self):

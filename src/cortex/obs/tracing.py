@@ -84,7 +84,10 @@ def _tracer() -> Any | None:
 
 
 def _attributes(
-    func: Callable[..., Any], args: tuple, kwargs: dict, capture: Sequence[str]
+    func: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    capture: Sequence[str],
 ) -> dict[str, Any]:
     if not capture:
         return {}
@@ -192,6 +195,6 @@ def observe(
                 _record(start, None)
                 return result
 
-        return sync_wrapper  # type: ignore[return-value]
+        return sync_wrapper
 
     return decorator

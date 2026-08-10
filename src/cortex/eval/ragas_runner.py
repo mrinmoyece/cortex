@@ -48,7 +48,7 @@ class EvalResult:
     failed_samples: int
     evaluated_at: float = field(default_factory=time.time)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         return {
             "faithfulness": round(self.faithfulness, 4),
             "answer_relevancy": round(self.answer_relevancy, 4),
@@ -86,8 +86,11 @@ class RagasEvaluator:
 
             self._ragas_available = True
             logger.info("eval.ragas_loaded")
-        except ImportError:
-            logger.warning("eval.ragas_not_available — using LLM-as-judge fallback")
+        except Exception as exc:
+            # Not just ImportError: ragas imports optional langchain backends at
+            # module scope, and a version skew there raises AttributeError or
+            # TypeError. Any failure here means the same thing - no ragas.
+            logger.warning("eval.ragas_not_available", error=str(exc))
 
     async def evaluate(self, samples: list[EvalSample]) -> EvalResult:
         """Evaluate a batch of samples. Returns aggregated metrics."""
@@ -95,7 +98,12 @@ class RagasEvaluator:
             raise ValueError("No samples to evaluate")
 
         if self._ragas_available:
-            return await self._ragas_eval(samples)
+            try:
+                return await self._ragas_eval(samples)
+            except Exception as exc:
+                # A ragas failure is an evaluation-infrastructure problem, and
+                # a degraded score is more useful than no score at all.
+                logger.warning("eval.ragas_eval_failed_falling_back", error=str(exc))
         return await self._llm_judge_eval(samples)
 
     async def _ragas_eval(self, samples: list[EvalSample]) -> EvalResult:
@@ -124,12 +132,18 @@ class RagasEvaluator:
                 metrics.append(context_recall)
 
             result = evaluate(dataset, metrics=metrics)
-            df = result.to_pandas()
+            to_pandas = getattr(result, "to_pandas", None)
+            if to_pandas is None:  # pragma: no cover - depends on ragas version
+                raise RuntimeError(f"unexpected ragas result type: {type(result).__name__}")
+            df = to_pandas()
 
-            faithfulness_score = float(df["faithfulness"].mean())
-            relevancy_score = float(df["answer_relevancy"].mean())
-            precision_score = float(df["context_precision"].mean())
-            recall_score = float(df["context_recall"].mean()) if has_ground_truth else None
+            def _mean(column: str) -> float:
+                return float(df[column].mean())
+
+            faithfulness_score = _mean("faithfulness")
+            relevancy_score = _mean("answer_relevancy")
+            precision_score = _mean("context_precision")
+            recall_score = _mean("context_recall") if has_ground_truth else None
 
             composite = (faithfulness_score + relevancy_score + precision_score) / 3.0
 

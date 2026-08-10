@@ -9,6 +9,7 @@ at the right granularity. Every exception carries a machine-readable
 from __future__ import annotations
 
 from http import HTTPStatus
+from typing import Any
 
 
 class CortexError(Exception):
@@ -17,7 +18,7 @@ class CortexError(Exception):
     http_status: HTTPStatus = HTTPStatus.INTERNAL_SERVER_ERROR
     code: str = "CORTEX_ERROR"
 
-    def __init__(self, message: str, *, details: dict | None = None) -> None:
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.details = details or {}
@@ -202,6 +203,38 @@ class MCPToolError(MCPError):
     """A specific MCP tool call failed."""
 
     code = "MCP_TOOL_FAILED"
+
+
+class MCPToolArgumentError(MCPError):
+    """The caller supplied arguments the tool cannot accept.
+
+    Distinct from `MCPToolError` because the blame is different, and so is
+    the status code. A tool that raises while doing its job is a 500; a
+    caller that passes an argument the tool does not have is a 422, and
+    telling them so is the difference between "try again with `query`" and
+    "something went wrong".
+
+    The distinction used to be impossible to make. The client wrapped every
+    exception - including the `TypeError` Python raises when arguments do
+    not match the signature - into `MCPToolError`, so the API's 422 branch
+    was unreachable code and a typo in a tool argument returned 500.
+    """
+
+    http_status = HTTPStatus.UNPROCESSABLE_ENTITY
+    code = "MCP_TOOL_BAD_ARGUMENTS"
+
+
+class MCPPermissionError(MCPError):
+    """The tool refused because the caller is not entitled to what it asked for.
+
+    Raised when a tool that acts on user-owned data has no authenticated
+    principal bound. It is a 403 rather than a 401: the caller may well be
+    authenticated to the API, and still have no identity bound *for this
+    tool call*, which is a different failure and needs a different message.
+    """
+
+    http_status = HTTPStatus.FORBIDDEN
+    code = "MCP_FORBIDDEN"
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────

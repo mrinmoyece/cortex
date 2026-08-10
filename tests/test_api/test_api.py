@@ -151,7 +151,7 @@ class TestIngestEndpoint:
 class TestAuthSystem:
     def test_create_token_valid_for_user(self):
         token = create_access_token(user_id="user-123")
-        from jose import jwt
+        import jwt
 
         from cortex.config import get_settings
 
@@ -172,4 +172,61 @@ class TestAuthSystem:
     @pytest.mark.asyncio
     async def test_missing_auth_header_rejected(self, client):
         response = await client.post("/api/v1/runs", json={"goal": "test"})
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_a_validly_signed_but_malformed_token_is_a_401_not_a_500(self, client):
+        """A token signed with our own key but missing `sub` used to raise
+        pydantic's ValidationError out of the dependency, which FastAPI turns
+        into a 500 with a stack trace - an auth failure reported as an
+        outage."""
+        import jwt
+
+        from cortex.config import get_settings
+
+        token = jwt.encode(
+            {"tenant": "acme", "exp": 9_999_999_999},
+            get_settings().secret_key.get_secret_value(),
+            algorithm="HS256",
+        )
+        response = await client.post(
+            "/api/v1/runs",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"goal": "test"},
+        )
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_an_expired_token_is_rejected(self, client):
+        import jwt
+
+        from cortex.config import get_settings
+
+        token = jwt.encode(
+            {"sub": "u", "tenant": "acme", "exp": 1_000_000_000},
+            get_settings().secret_key.get_secret_value(),
+            algorithm="HS256",
+        )
+        response = await client.post(
+            "/api/v1/runs",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"goal": "test"},
+        )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Token expired"
+
+    @pytest.mark.asyncio
+    async def test_a_token_signed_with_another_key_is_rejected(self, client):
+        import jwt
+
+        token = jwt.encode(
+            {"sub": "attacker", "tenant": "acme", "exp": 9_999_999_999},
+            "not-the-server-key",
+            algorithm="HS256",
+        )
+        response = await client.post(
+            "/api/v1/runs",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"goal": "test"},
+        )
         assert response.status_code == 401

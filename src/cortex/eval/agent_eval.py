@@ -33,7 +33,9 @@ the one nobody installs.
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass, field
+from typing import Any
 
 from cortex.graph.state import CortexState, RunStatus, TaskStatus
 from cortex.logging_config import get_logger
@@ -84,7 +86,7 @@ class AgentScore:
             and self.termination >= min_termination
         )
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "task_completion": round(self.task_completion, 4),
             "tool_correctness": round(self.tool_correctness, 4),
@@ -205,12 +207,17 @@ class AgentEvaluator:
 
         if self._deepeval_available:
             try:
-                from deepeval.metrics import TaskCompletionMetric
-                from deepeval.test_case import LLMTestCase
+                task_completion_metric_cls = importlib.import_module(
+                    "deepeval.metrics"
+                ).TaskCompletionMetric
+                llm_test_case_cls = importlib.import_module("deepeval.test_case").LLMTestCase
 
-                metric = TaskCompletionMetric(threshold=0.7)
-                case = LLMTestCase(input=state.user_goal, actual_output=state.final_output)
+                metric = task_completion_metric_cls(threshold=0.7)
+                case = llm_test_case_cls(input=state.user_goal, actual_output=state.final_output)
                 metric.measure(case)
+                # `score` is None when deepeval could not reach its judge model.
+                if metric.score is None:
+                    raise RuntimeError("deepeval returned no score")
                 return float(metric.score), f"deepeval: {metric.reason or 'scored'}"
             except Exception as exc:
                 logger.warning("eval.deepeval_failed_falling_back", error=str(exc))
@@ -234,7 +241,7 @@ class AgentEvaluator:
                     },
                     {
                         "role": "user",
-                        "content": f"Goal: {state.user_goal}\n\nAnswer: {state.final_output[:4000]}",
+                        "content": f"Goal: {state.user_goal}\n\nAnswer: {(state.final_output or '')[:4000]}",
                     },
                 ],
                 run_id="agent-eval",

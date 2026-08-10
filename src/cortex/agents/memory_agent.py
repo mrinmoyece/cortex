@@ -15,19 +15,29 @@ At run end: consolidate run summary to episodic; extract new facts to semantic.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
+from functools import lru_cache
 from typing import Any
 
 import litellm
 import redis.asyncio as aioredis
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 from cortex.config import settings
 from cortex.graph.state import CortexState, MemoryContext, RunStatus
 from cortex.logging_config import get_logger
+from cortex.obs.metrics import memory_operations_total
 from cortex.obs.tracing import observe
 
 logger = get_logger(__name__)
@@ -70,12 +80,23 @@ class WorkingMemory:
         self._token_budget = token_budget
         self._tokens_used = 0
 
-    def add(self, key: str, content: str, metadata: dict | None = None) -> bool:
-        """Add item. Returns False if budget would be exceeded."""
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _encoder() -> Any:
+        """The tokeniser, loaded once per process.
+
+        `tiktoken.get_encoding` was called on every `add`. It reads (and on
+        a cold machine downloads) the BPE file, so the token accounting that
+        exists to bound the context window was itself doing unbounded work
+        on the hot path.
+        """
         import tiktoken
 
-        enc = tiktoken.get_encoding("cl100k_base")
-        tokens = len(enc.encode(content))
+        return tiktoken.get_encoding("cl100k_base")
+
+    def add(self, key: str, content: str, metadata: dict[str, Any] | None = None) -> bool:
+        """Add item. Returns False if budget would be exceeded."""
+        tokens = len(self._encoder().encode(content))
 
         if self._tokens_used + tokens > self._token_budget:
             logger.warning("working_memory.budget_exceeded", key=key, tokens_needed=tokens)
@@ -109,12 +130,16 @@ class EpisodicMemory:
 
     async def _get_redis(self) -> aioredis.Redis:
         if self._redis is None:
-            db_url = str(settings.redis_url).rsplit("/", 1)[0] + f"/{settings.redis_episodic_db}"
-            self._redis = await aioredis.from_url(db_url, encoding="utf-8", decode_responses=True)
+            db_url = settings.redis_url_for_db(settings.redis_episodic_db)
+            self._redis = aioredis.Redis.from_url(db_url, encoding="utf-8", decode_responses=True)
         return self._redis
 
     async def store(
-        self, user_id: str, session_id: str, summary: dict, tenant_id: str = DEFAULT_TENANT
+        self,
+        user_id: str,
+        session_id: str,
+        summary: dict[str, Any],
+        tenant_id: str = DEFAULT_TENANT,
     ) -> None:
         redis = await self._get_redis()
         key = _EPISODIC_KEY.format(tenant_id=tenant_id, user_id=user_id)
@@ -128,15 +153,17 @@ class EpisodicMemory:
         pipe.zadd(key, {member_key: score})
         pipe.zremrangebyrank(key, 0, -51)  # Keep last 50 episodes
         await pipe.execute()
+        memory_operations_total.labels(tier="episodic", operation="write").inc()
         logger.debug("episodic.stored", user_id=user_id, session_id=session_id)
 
     async def retrieve_recent(
         self, user_id: str, limit: int = 5, tenant_id: str = DEFAULT_TENANT
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         redis = await self._get_redis()
         key = _EPISODIC_KEY.format(tenant_id=tenant_id, user_id=user_id)
         # Fetch most recent member keys
         member_keys = await redis.zrevrange(key, 0, limit - 1)
+        memory_operations_total.labels(tier="episodic", operation="read").inc()
         if not member_keys:
             return []
 
@@ -193,10 +220,11 @@ class SemanticMemory:
 
     async def _embed(self, text: str) -> list[float]:
         response = await litellm.aembedding(model=settings.embedding_model, input=[text])
-        return response.data[0]["embedding"]
+        embedding: list[float] = response.data[0]["embedding"]
+        return embedding
 
     async def store_facts(
-        self, facts: list[dict], user_id: str, tenant_id: str = DEFAULT_TENANT
+        self, facts: list[dict[str, Any]], user_id: str, tenant_id: str = DEFAULT_TENANT
     ) -> None:
         """Store a list of extracted facts. Each fact: {content, source, entity_type}"""
         if not facts:
@@ -222,30 +250,36 @@ class SemanticMemory:
                 )
             )
         await client.upsert(collection_name=settings.qdrant_collection_memory, points=points)
+        memory_operations_total.labels(tier="semantic", operation="write").inc()
         logger.debug("semantic.facts_stored", count=len(facts), user_id=user_id)
 
     async def retrieve(
         self, query: str, user_id: str, top_k: int = 10, tenant_id: str = DEFAULT_TENANT
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Retrieve relevant facts, filtered to this tenant AND this user."""
         client = await self._get_client()
         vector = await self._embed(query)
-        results = await client.search(
+        response = await client.query_points(
             collection_name=settings.qdrant_collection_memory,
-            query_vector=vector,
+            query=vector,
             limit=top_k,
-            query_filter={
-                "must": [
-                    {"key": "tenant_id", "match": {"value": tenant_id}},
-                    {"key": "user_id", "match": {"value": user_id}},
+            query_filter=Filter(
+                must=[
+                    FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id)),
                 ]
-            },
+            ),
             score_threshold=0.72,
+            with_payload=True,
         )
-        return [{"content": r.payload["content"], "score": r.score, **r.payload} for r in results]
+        memory_operations_total.labels(tier="semantic", operation="read").inc()
+        return [
+            {**(r.payload or {}), "content": (r.payload or {}).get("content", ""), "score": r.score}
+            for r in response.points
+        ]
 
 
-def _facts_from_episode(episode: dict) -> list[dict]:
+def _facts_from_episode(episode: dict[str, Any]) -> list[dict[str, Any]]:
     """Derive durable facts from a settled run summary.
 
     Structured fields only - never the free-form output. Memorising model
@@ -289,8 +323,6 @@ class MemoryAgent:
         """Gather relevant context from episodic and semantic stores."""
         episodic_task = self.episodic.retrieve_recent(user_id, limit=5, tenant_id=tenant_id)
         semantic_task = self.semantic.retrieve(user_goal, user_id, top_k=10, tenant_id=tenant_id)
-
-        import asyncio
 
         episodic, semantic = await asyncio.gather(episodic_task, semantic_task)
 
@@ -359,7 +391,14 @@ class MemoryAgent:
         #
         #   index:   cortex:episodic:{tenant}:{user}            - 3 colons
         #   payload: cortex:episodic:{tenant}:{user}:{session}  - 4 colons
-        index_keys = [k for k in await redis.keys(f"{_EPISODIC_KEY_PREFIX}*") if k.count(":") == 3]
+        # `KEYS` blocks Redis for the whole scan and is O(total keys) - on a
+        # store with a real episode history that is a stall for every other
+        # client on the instance. `SCAN` is cursor-based and yields.
+        index_keys = [
+            k
+            async for k in redis.scan_iter(match=f"{_EPISODIC_KEY_PREFIX}*", count=500)
+            if k.count(":") == 3
+        ]
         for key in index_keys:
             # Sorted by timestamp, so this asks Redis for exactly the
             # settled members rather than fetching everything and
@@ -394,7 +433,7 @@ class MemoryAgent:
         logger.info("memory.sweep_complete", facts_promoted=promoted)
         return promoted
 
-    def _extract_facts(self, state: CortexState) -> list[dict]:
+    def _extract_facts(self, state: CortexState) -> list[dict[str, Any]]:
         """Simple heuristic fact extraction — replace with LLM extraction in prod."""
         facts = []
         for task in state.completed_tasks():

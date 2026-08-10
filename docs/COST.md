@@ -19,18 +19,39 @@ The check happens in Redis — it's consistent across parallel task execution. I
 
 ## Semantic Cache
 
-Before every LLM call, the router embeds the prompt and searches Qdrant for a near-identical previous response:
+Before an LLM call, the router embeds the **prompt text** and searches Qdrant
+for a near-identical previous response, within the caller's own scope:
 
 ```python
-cache_key = sha256(f"{model}:{messages}")
-cached = await self._cache.get(cache_key)
-if cached:
+cached = await self._cache.get(prompt, model=model, scope=cache_scope)
+if cached is not None:
     return cached  # Free — no LLM call
 ```
 
-**Cache hit threshold:** `SEMANTIC_CACHE_SIMILARITY_THRESHOLD=0.95` (default). Tune down to 0.90 for more hits at the cost of occasional stale answers.
+Two things here were wrong and are worth stating plainly, because both
+produced *wrong answers* rather than slow ones:
+
+- **It embedded a SHA-256 digest, not the prompt.** Cosine similarity between
+  hex digests is noise — two semantically identical prompts hash to unrelated
+  strings, and two unrelated prompts can embed closer than two paraphrases.
+  The "semantic" cache was neither semantic nor sound. The prompt text is now
+  what gets embedded; only its digest is stored in the payload, so the cache
+  can be checked for an exact match without keeping prompt text at rest.
+- **There was no scope.** With a 0.95 threshold and no tenant partition, a
+  near-collision served one tenant's answer to another. Reads and writes are
+  now filtered on `scope` *and* `model`, and **the cache is skipped entirely
+  when no scope is supplied** — an unscoped call is a caller that has not
+  thought about isolation, and the safe response to that is a cache miss, not
+  a shared bucket. `cache_scope=state.tenant_id` is threaded through the
+  planner, critic and executor.
+
+**Cache hit threshold:** `SEMANTIC_CACHE_SIMILARITY_THRESHOLD=0.95` (default). Tune down to 0.90 for more hits at the cost of occasional stale answers — and note that lowering it widens the near-collision window the scope filter now contains.
 
 **Cache TTL:** 24 hours. After that, the response is re-fetched from the LLM.
+
+**Failure mode:** the cache fails **open**. A Qdrant outage produces a miss and
+a real LLM call, because a cache is an optimisation. (The moderation layer
+fails *closed*, for the opposite reason — see [GUARDRAILS.md](GUARDRAILS.md).)
 
 **When it helps most:**
 - High-traffic deployments where many users ask equivalent questions

@@ -59,6 +59,35 @@ class TestSearchKnowledgeTool:
             assert call_kwargs["top_k"] >= 1
 
 
+class TestExecuteCodeIsOffByDefault:
+    """`execute_code` is not a sandbox, so it must not be reachable unless a
+    deployment has explicitly accepted that risk."""
+
+    @pytest.mark.asyncio
+    async def test_refused_when_not_enabled(self):
+        from cortex.mcp.server import execute_code
+
+        result = await execute_code(code="print('hello')")
+        assert result["exit_code"] == -1
+        assert "disabled" in result["error"].lower()
+        assert "stdout" not in result
+
+    @pytest.mark.asyncio
+    async def test_schema_is_not_advertised_when_disabled(self):
+        from cortex.mcp.client import MCPClient
+
+        names = {s["function"]["name"] for s in await MCPClient().get_tool_schemas()}
+        assert "execute_code" not in names
+
+    @pytest.mark.asyncio
+    async def test_schema_is_advertised_when_enabled(self, code_execution_enabled):
+        from cortex.mcp.client import MCPClient
+
+        names = {s["function"]["name"] for s in await MCPClient().get_tool_schemas()}
+        assert "execute_code" in names
+
+
+@pytest.mark.usefixtures("code_execution_enabled")
 class TestExecuteCodeTool:
     @pytest.mark.asyncio
     async def test_executes_simple_python(self):
@@ -195,3 +224,74 @@ class TestMCPClient:
 
         with pytest.raises(MCPToolError, match="bad_tool"):
             await client.call_tool("bad_tool", {})
+
+
+class TestMemoryToolsAreBoundToTheCallerIdentity:
+    """`query_memory(user_id=...)` took the identity as a tool argument, which
+    means the *model* chose whose memory to read. Prompt injection aside, any
+    caller could enumerate another user's history by guessing an id. The
+    identity now comes from the authenticated principal and cannot be reached
+    from the argument schema at all."""
+
+    def test_the_tool_signature_has_no_user_id(self):
+        import inspect
+
+        from cortex.mcp.server import query_memory
+
+        assert "user_id" not in inspect.signature(query_memory).parameters
+
+    @pytest.mark.asyncio
+    async def test_an_unbound_call_is_refused(self):
+        """Fails closed. Defaulting to an anonymous or "system" identity would
+        make every unbound call read one shared store - exactly the
+        cross-tenant behaviour this replaced."""
+        from cortex.mcp.server import query_memory
+
+        with pytest.raises(PermissionError, match="No authenticated principal"):
+            await query_memory(query="anything")
+
+    @pytest.mark.asyncio
+    async def test_the_bound_principal_reaches_both_memory_tiers(self):
+        from cortex.mcp.server import Principal, query_memory, use_principal
+
+        memory = MagicMock()
+        memory.episodic.retrieve_recent = AsyncMock(return_value=[])
+        memory.semantic.retrieve = AsyncMock(return_value=[])
+
+        with patch("cortex.mcp.server._get_memory", return_value=memory):
+            with use_principal(Principal(user_id="alice", tenant_id="acme")):
+                await query_memory(query="what did I ask")
+
+        assert memory.episodic.retrieve_recent.await_args.args[0] == "alice"
+        assert memory.episodic.retrieve_recent.await_args.kwargs["tenant_id"] == "acme"
+        assert memory.semantic.retrieve.await_args.args[1] == "alice"
+        assert memory.semantic.retrieve.await_args.kwargs["tenant_id"] == "acme"
+
+    @pytest.mark.asyncio
+    async def test_the_binding_does_not_leak_past_the_call(self):
+        from cortex.mcp.server import Principal, query_memory, use_principal
+
+        memory = MagicMock()
+        memory.episodic.retrieve_recent = AsyncMock(return_value=[])
+        memory.semantic.retrieve = AsyncMock(return_value=[])
+        with patch("cortex.mcp.server._get_memory", return_value=memory):
+            with use_principal(Principal(user_id="alice")):
+                await query_memory(query="q")
+
+        with pytest.raises(PermissionError):
+            await query_memory(query="q")
+
+    @pytest.mark.asyncio
+    async def test_the_limit_is_clamped(self):
+        """`limit` is model-supplied. Unclamped, a hallucinated 100000 turns
+        one tool call into a full memory dump."""
+        from cortex.mcp.server import Principal, query_memory, use_principal
+
+        memory = MagicMock()
+        memory.episodic.retrieve_recent = AsyncMock(return_value=[])
+        memory.semantic.retrieve = AsyncMock(return_value=[])
+        with patch("cortex.mcp.server._get_memory", return_value=memory):
+            with use_principal(Principal(user_id="alice")):
+                await query_memory(query="q", limit=100_000)
+
+        assert memory.episodic.retrieve_recent.await_args.kwargs["limit"] == 50

@@ -4,16 +4,43 @@ Cortex treats quality as a first-class engineering concern. Evaluation runs auto
 
 ## Philosophy
 
-Most AI systems are evaluated manually and infrequently. Cortex runs automated evaluation:
-- **On every deployment** (CI gate)
-- **Every 6 hours** (Celery beat schedule)
+Most AI systems are evaluated manually and infrequently. Cortex is wired to run
+evaluation:
+- **Every 6 hours** (Celery beat schedule, when a worker and beat are running)
 - **On demand** (any developer can run locally)
 
-Results are stored as Prometheus time-series metrics, so quality regressions are visible in Grafana before users notice them.
+Results are stored as Prometheus time-series metrics, so quality regressions are
+visible in Grafana before users notice them.
+
+> **Scope, honestly.** The evaluation *harness* is tested; the *scores* are
+> not a validated quality claim. Nobody has run this suite against a live
+> corpus and a real model, so the thresholds below are targets chosen up
+> front, not measurements. CI does not gate on them — it runs the unit tests
+> for the harness. Wiring the eval into a deployment gate is a deliberate
+> decision that needs a baseline first.
+
+## Installing the evaluation extra
+
+`ragas` and `deepeval` are **not** runtime dependencies. They are heavy, and
+they drag transitive packages with open advisories into the production
+closure for a code path that never runs in production:
+
+```bash
+pip install -e ".[eval]"
+```
+
+Without the extra, `RagasEvaluator` falls back to an LLM judge and logs
+`eval.ragas_not_available`. That is a supported mode, not a broken one.
+
+> `import ragas` currently fails even when installed, against the released
+> `langchain-community` — it imports `langchain_community.chat_models.vertexai`,
+> which no longer exists. The import is guarded, so the fallback engages
+> automatically rather than crashing the run. See [LIMITATIONS.md](LIMITATIONS.md).
 
 ## Ragas Metrics
 
-Cortex uses [Ragas](https://docs.ragas.io) as its primary evaluation library.
+Cortex uses [Ragas](https://docs.ragas.io) as its primary evaluation library,
+when it is installed and importable.
 
 | Metric | Definition | Target |
 |--------|-----------|--------|

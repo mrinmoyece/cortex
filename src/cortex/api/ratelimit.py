@@ -31,9 +31,11 @@ and the interface here does not change when that arrives.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -87,19 +89,36 @@ class TokenBucket:
 class RateLimiter:
     """Buckets keyed by principal, created on first sight."""
 
-    def __init__(self, per_minute: float | None = None, burst: float | None = None) -> None:
+    def __init__(
+        self,
+        per_minute: float | None = None,
+        burst: float | None = None,
+        max_buckets: int | None = None,
+    ) -> None:
         self._per_minute = (
             per_minute if per_minute is not None else settings.api_rate_limit_per_minute
         )
         # A burst of a quarter of the per-minute rate: enough for a page that
         # fires several requests at once, far short of a useful flood.
         self._burst = burst if burst is not None else max(5.0, self._per_minute / 4)
-        self._buckets: dict[str, TokenBucket] = {}
+        # Bounded, LRU. The key is caller-controlled - an unauthenticated
+        # attacker picks it simply by changing source address, and a
+        # spoofable `X-Forwarded-For` would let one host mint unlimited
+        # keys - so an unbounded map here is a memory-exhaustion primitive
+        # reachable without a credential.
+        self._max_buckets = int(
+            max_buckets if max_buckets is not None else settings.api_rate_limit_max_buckets
+        )
+        self._buckets: OrderedDict[str, TokenBucket] = OrderedDict()
         self._lock = threading.Lock()
 
     @property
     def per_minute(self) -> float:
         return self._per_minute
+
+    @property
+    def bucket_count(self) -> int:
+        return len(self._buckets)
 
     def check(self, principal: str) -> Decision:
         with self._lock:
@@ -107,7 +126,15 @@ class RateLimiter:
             if bucket is None:
                 bucket = TokenBucket(self._burst, self._per_minute / 60.0)
                 self._buckets[principal] = bucket
-        return bucket.consume()
+                # Evicting the least recently seen principal is a deliberate
+                # fail-open for that key: it gets a fresh bucket. The
+                # alternative - refusing new principals once full - lets an
+                # attacker deny service to every legitimate caller.
+                while len(self._buckets) > self._max_buckets:
+                    self._buckets.popitem(last=False)
+            else:
+                self._buckets.move_to_end(principal)
+            return bucket.consume()
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -134,14 +161,24 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if auth.lower().startswith("bearer "):
             token = auth[7:].strip()
             if token:
-                # The token itself is the bucket key. Two requests with the
-                # same token share a bucket without this layer needing to
-                # know, or trust, what is inside it.
-                return f"token:{hash(token) & 0xFFFFFFFF:08x}"
+                # The token identifies the bucket, but is never used as the
+                # key directly - bucket keys end up in memory dumps and, one
+                # careless log line later, in logs.
+                #
+                # `hash(token) & 0xFFFFFFFF` was the previous key. Two
+                # problems: 32 bits is ~77k tokens to a 50% collision by the
+                # birthday bound, and colliding principals *share a bucket*,
+                # so one caller can exhaust another's allowance. And
+                # `hash()` on str is randomised per process, so the same
+                # token keyed differently in every worker.
+                digest = hashlib.blake2b(token.encode(), digest_size=16).hexdigest()
+                return f"token:{digest}"
         client = request.client
         return f"anon:{client.host if client else 'unknown'}"
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
         if request.url.path in self.EXEMPT_PATHS:
             return await call_next(request)
 

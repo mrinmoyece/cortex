@@ -26,20 +26,16 @@ dependencies = [
     "cohere>=5.0.0",
     "rank-bm25>=0.2.2",
 
-    # Evaluation
-    "ragas>=0.2.0",
-    # Agent-level metrics. Optional at runtime - see
-    # `eval/agent_eval.py`: three of four axes are computed from the run's
-    # own structure and need no model, so the fallback is not a stub.
-    "deepeval>=2.0.0",
-
     # Memory
     "redis[hiredis]>=5.0.0",
 
     # Safety
     "nemoguardrails>=0.10.0",
+    # presidio-anonymizer was declared but never used: the redaction path
+    # builds its own placeholders so the regex and Presidio results can be
+    # merged. It also pinned cryptography<49, holding three fixed advisories
+    # out of reach.
     "presidio-analyzer>=2.2.0",
-    "presidio-anonymizer>=2.2.0",
 
     # Observability
     "opentelemetry-sdk>=1.28.0",
@@ -51,7 +47,10 @@ dependencies = [
     # API
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
-    "python-jose[cryptography]>=3.3.0",
+    # PyJWT rather than python-jose: python-jose pulls in `ecdsa`, which has
+    # an unfixed timing-attack advisory (PYSEC-2026-1325) and no release that
+    # resolves it. Cortex signs with HS256 and needs none of it.
+    "PyJWT>=2.9.0",
     "python-multipart>=0.0.12",
 
     # Background tasks
@@ -74,6 +73,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Offline quality evaluation. Kept out of the runtime closure because
+# neither library is needed to serve a request, both are heavy, and ragas
+# in particular drags in a transitive tree (diskcache, pillow) with open
+# advisories that would otherwise gate the API image. `cortex.eval` falls
+# back to LLM-as-judge when they are absent - see docs/LIMITATIONS.md.
+eval = [
+    "ragas>=0.2.0",
+    "deepeval>=2.0.0",
+]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -94,6 +102,7 @@ dev = [
     "ruff>=0.7.0",
     "mypy>=1.13.0",
     "pre-commit>=4.0.0",
+    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 [project.scripts]
@@ -128,11 +137,24 @@ ignore = [
 # every `def test_x() -> None` adds ceremony and catches nothing; hardcoded
 # credentials in fixtures are the point of the fixture.
 "tests/**" = ["ANN", "S105", "S106", "S108", "SLF001", "N802"]
+# The audit script shells out to pip with a fixed argument list; there is no
+# untrusted input to check for.
+"scripts/audit.py" = ["S603"]
+# `load_dotenv()` has to run before cortex.config is imported, which is the
+# one place an import genuinely cannot be at the top of the file.
+"scripts/gen_token.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
 ignore_missing_imports = true
+
+# Celery's `@app.task` decorator is untyped, so strict mode declares every
+# task function untyped by association. Narrowing the exemption to the one
+# module that defines tasks keeps the rest of the codebase strict.
+[[tool.mypy.overrides]]
+module = "cortex.workers.celery_app"
+disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]
 # `perf` is a top-level package alongside `src`, so the gate's own tests can

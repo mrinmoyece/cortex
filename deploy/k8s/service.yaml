@@ -32,6 +32,15 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # /metrics is served on the same port as the API and carries model names,
+    # spend totals and run volumes. The pod annotations below let Prometheus
+    # scrape it in-cluster; nothing should reach it from the internet, and a
+    # "/" prefix rule otherwise publishes it along with everything else.
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location /metrics {
+        deny all;
+        return 403;
+      }
 spec:
   rules:
     - host: cortex.yourdomain.com
@@ -59,13 +68,15 @@ data:
   API_WORKERS: "4"
   QDRANT_URL: "http://qdrant:6333"
   REDIS_URL: "redis://redis:6379/0"
-  DATABASE_URL: "postgresql+asyncpg://cortex:cortex@postgres:5432/cortex"
   OTEL_EXPORTER_ENDPOINT: "http://phoenix:4317"
   PHOENIX_ENDPOINT: "http://phoenix:6006"
   GUARDRAILS_ENABLED: "true"
   PII_DETECTION_ENABLED: "true"
   INJECTION_DETECTION_ENABLED: "true"
   MAX_COST_PER_RUN_USD: "2.00"
+  # Off by default: execute_code runs a subprocess in the API container with
+  # no kernel-level isolation. See docs/LIMITATIONS.md before enabling it.
+  CODE_EXECUTION_ENABLED: "false"
 
 ---
 # Secret values — in production, inject from AWS Secrets Manager / Azure Key Vault
@@ -81,6 +92,32 @@ stringData:
   OPENAI_API_KEY: "REPLACE_WITH_KEY"
   ANTHROPIC_API_KEY: "REPLACE_WITH_KEY"
   COHERE_API_KEY: "REPLACE_WITH_KEY"
+  # METRICS_TOKEN is deliberately NOT set here.
+  #
+  # These manifests scrape with the `prometheus.io/scrape` pod annotations,
+  # and annotation-based scraping sends no credential. Shipping a token in
+  # this Secret therefore did not secure anything - it broke the scrape. The
+  # metrics endpoint would 401 every request, the dashboards would go blank,
+  # and the first person to debug it would remove the token, which is the
+  # state we are in anyway, arrived at slowly.
+  #
+  # What protects it in these manifests is the ingress rule above, which
+  # refuses /metrics from outside the cluster. Anything already inside the
+  # cluster can still reach it; restricting that needs a NetworkPolicy,
+  # which is not shipped here because an untested one silently breaks
+  # scraping. To require a token instead, set METRICS_TOKEN here and give
+  # Prometheus the matching credential - which means a scrape config, not an
+  # annotation:
+  #
+  #   scrape_configs:
+  #     - job_name: cortex-api
+  #       kubernetes_sd_configs: [{role: pod}]
+  #       authorization:
+  #         type: Bearer
+  #         credentials_file: /etc/prometheus/secrets/cortex/METRICS_TOKEN
+  #
+  # mounting the same Secret into the Prometheus pod. Doing one half of that
+  # is worse than doing neither.
 
 ---
 apiVersion: policy/v1

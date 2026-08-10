@@ -47,10 +47,11 @@ def configure_logging() -> None:
         structlog.processors.format_exc_info,
     ]
 
-    if is_local:
-        renderer = structlog.dev.ConsoleRenderer(colors=True)
-    else:
-        renderer = structlog.processors.JSONRenderer()
+    renderer: structlog.typing.Processor = (
+        structlog.dev.ConsoleRenderer(colors=True)
+        if is_local
+        else structlog.processors.JSONRenderer()
+    )
 
     structlog.configure(
         processors=[
@@ -87,4 +88,5 @@ def configure_logging() -> None:
 
 
 def get_logger(name: str) -> structlog.BoundLogger:
-    return structlog.get_logger(name)
+    logger: structlog.BoundLogger = structlog.get_logger(name)
+    return logger

@@ -7,11 +7,15 @@ can connect to this server and call its tools.
 
 Tools exposed:
   - search_knowledge   — hybrid RAG search over ingested documents
-  - query_memory       — retrieve from the three-tier memory system
-  - execute_code       — sandboxed Python execution
+  - query_memory       — retrieve the calling principal's own memory
+  - execute_code       — Python execution in a subprocess; NOT a sandbox,
+                         and disabled unless CODE_EXECUTION_ENABLED=true
   - query_data         — natural-language-to-SQL over configured databases
-  - web_search         — SerpAPI-backed web search
   - synthesise         — structured summarisation / synthesis
+
+There is no `web_search` tool. It was listed here and named in the planner's
+prompt, but was never implemented, so the planner produced task plans
+referencing a tool the executor could not call.
 
 Run with:
     cortex-mcp
@@ -27,6 +31,9 @@ import re
 import sqlite3
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +61,7 @@ mcp = FastMCP(
     # parameter, and this text is what a connecting client is shown.
     instructions=(
         "Cortex agentic AI platform - knowledge retrieval, long-term memory, "
-        "sandboxed code execution and structured data queries."
+        "and structured data queries."
     ),
 )
 
@@ -68,6 +75,115 @@ DATABASE_ALIASES: dict[str, str] = {
     )
     if alias and path
 }
+
+# ── Calling principal ─────────────────────────────────────────────────────────
+#
+# `query_memory` used to take `user_id` as a tool argument. Tool arguments are
+# chosen by the model, and through `POST /api/v1/mcp/call` they are chosen
+# directly by the HTTP caller - so "whose memory do I read" was an
+# attacker-controlled string. Any authenticated user could read any other
+# user's memory by passing their id, and a prompt-injection payload sitting
+# in a retrieved document could make the model do it unprompted.
+#
+# The principal is now bound out of band, by whatever authenticated the
+# request, and the tool cannot see or override it.
+
+_principal: ContextVar[Principal | None] = ContextVar("cortex_mcp_principal", default=None)
+
+#: Process-wide fallback identity, set only by `configure_default_principal`.
+#: See `current_principal` for why this is not simply a default argument.
+_default_principal: Principal | None = None
+
+
+@dataclass(frozen=True)
+class Principal:
+    """The authenticated identity a tool call runs as."""
+
+    user_id: str
+    tenant_id: str = "default"
+
+
+@contextlib.contextmanager
+def use_principal(principal: Principal) -> Iterator[None]:
+    """Bind the calling principal for the duration of a tool call."""
+    token = _principal.set(principal)
+    try:
+        yield
+    finally:
+        _principal.reset(token)
+
+
+def configure_default_principal(transport: str) -> Principal | None:
+    """Install the process-wide identity for a standalone MCP server.
+
+    An MCP transport carries no authentication. Over **stdio** that is fine
+    to work with: the client spawns the process, one process serves one
+    desktop client belonging to one person, and the operator writing that
+    client's config is in a position to say whose data it may touch. Setting
+    `MCP_PRINCIPAL_USER_ID` is that statement, made explicitly, in the place
+    where the process is launched.
+
+    Over **http** and **sse** it is not fine, and no configuration makes it
+    fine: FastMCP serves every caller on the port identically, so a single
+    declared identity would hand one user's memory to whoever reached the
+    socket. This refuses to install a default there, whatever is configured,
+    and says why. Reaching memory tools over the network goes through
+    `POST /api/v1/mcp/call`, which authenticates the caller first.
+
+    Returns the installed principal, or None.
+    """
+    global _default_principal
+
+    configured = settings.mcp_principal_user_id
+    if not configured:
+        _default_principal = None
+        logger.info("mcp.no_default_principal", transport=transport)
+        return None
+
+    if transport != "stdio":
+        _default_principal = None
+        logger.warning(
+            "mcp.default_principal_refused",
+            transport=transport,
+            reason=(
+                "MCP_PRINCIPAL_USER_ID is only honoured on the stdio transport. "
+                "An HTTP/SSE MCP server has no per-caller authentication, so a "
+                "process-wide identity would expose one user's data to every "
+                "caller. Use POST /api/v1/mcp/call instead."
+            ),
+        )
+        return None
+
+    _default_principal = Principal(user_id=configured, tenant_id=settings.mcp_principal_tenant_id)
+    logger.info(
+        "mcp.default_principal_configured",
+        transport=transport,
+        tenant_id=_default_principal.tenant_id,
+    )
+    return _default_principal
+
+
+def current_principal() -> Principal:
+    """Return the bound principal, or refuse.
+
+    Failing closed matters here: defaulting to an anonymous or "system"
+    identity would make every memory tool call read some shared store, which
+    is exactly the cross-tenant behaviour this replaced.
+
+    The per-call binding wins over the process-wide default, so a request
+    that *does* carry an identity is never served under someone else's.
+    """
+    principal = _principal.get() or _default_principal
+    if principal is None:
+        raise PermissionError(
+            "No authenticated principal is bound for this MCP tool call, so "
+            "tools that read user-owned data are unavailable. Call through "
+            "POST /api/v1/mcp/call (which binds the caller's identity), run "
+            "the tool inside cortex.mcp.server.use_principal(...), or - for a "
+            "single-user stdio server only - set MCP_PRINCIPAL_USER_ID."
+        )
+    return principal
+
 
 # Lazily initialised singletons (avoid slow startup on import)
 _rag: RAGPipeline | None = None
@@ -109,9 +225,7 @@ async def search_knowledge(
         List of ranked chunks with content, source, and relevance score.
     """
     top_k = max(1, min(top_k, 20))
-    filters = (
-        {"must": [{"key": "source", "match": {"value": source_filter}}]} if source_filter else None
-    )
+    filters = {"source": source_filter} if source_filter else None
 
     rag = _get_rag()
     chunks = await rag.retrieve(query, top_k=top_k, filters=filters)
@@ -131,30 +245,38 @@ async def search_knowledge(
 @mcp.tool()
 async def query_memory(
     query: str,
-    user_id: str,
     memory_type: str = "all",
     limit: int = 5,
 ) -> dict[str, Any]:
     """
-    Retrieve relevant memories for a user from episodic or semantic stores.
+    Retrieve relevant memories for the *calling user* from episodic or
+    semantic stores.
+
+    There is deliberately no `user_id` argument: the identity comes from the
+    authenticated principal, never from the model or the caller.
 
     Args:
         query:       Query to match against stored memories.
-        user_id:     User whose memory to search.
         memory_type: "episodic" (past runs), "semantic" (facts), or "all".
         limit:       Maximum results per tier.
 
     Returns:
         Dict with "episodic" and/or "semantic" keys containing memory items.
     """
+    principal = current_principal()
+    limit = max(1, min(limit, 50))
     memory = _get_memory()
     result: dict[str, Any] = {}
 
     if memory_type in ("all", "episodic"):
-        result["episodic"] = await memory.episodic.retrieve_recent(user_id, limit=limit)
+        result["episodic"] = await memory.episodic.retrieve_recent(
+            principal.user_id, limit=limit, tenant_id=principal.tenant_id
+        )
 
     if memory_type in ("all", "semantic"):
-        result["semantic"] = await memory.semantic.retrieve(query, user_id, top_k=limit)
+        result["semantic"] = await memory.semantic.retrieve(
+            query, principal.user_id, top_k=limit, tenant_id=principal.tenant_id
+        )
 
     return result
 
@@ -166,7 +288,18 @@ async def execute_code(
     timeout_seconds: int = 30,
 ) -> dict[str, Any]:
     """
-    Execute code in a sandboxed subprocess. Only Python is supported.
+    Execute Python in a subprocess. **Disabled by default.**
+
+    This is not a sandbox, and the previous docstring calling it one was the
+    most dangerous line in the repository. The subprocess runs as the same
+    OS user, with the same filesystem, network and credentials as the API
+    process; the pattern denylist below stops a careless prompt, not an
+    attacker (`importlib`, `open`, `builtins`, and `getattr` chains all walk
+    straight past it).
+
+    It is therefore off unless `CODE_EXECUTION_ENABLED=true` is set
+    deliberately, on a host where running arbitrary attacker-supplied code
+    is already an accepted risk. See docs/LIMITATIONS.md.
 
     Args:
         code:             Python code to execute.
@@ -176,6 +309,16 @@ async def execute_code(
     Returns:
         Dict with "stdout", "stderr", "exit_code", and "timed_out" fields.
     """
+    if not settings.code_execution_enabled:
+        return {
+            "error": (
+                "Code execution is disabled. It is not sandboxed; set "
+                "CODE_EXECUTION_ENABLED=true only on a host where arbitrary "
+                "code execution is acceptable."
+            ),
+            "exit_code": -1,
+        }
+
     if language != "python":
         return {
             "error": f"Language '{language}' not supported. Only 'python' is allowed.",
@@ -215,6 +358,11 @@ async def execute_code(
             }
         except asyncio.TimeoutError:
             proc.kill()
+            # Reaped, not just signalled. `kill()` without a `wait()` leaves
+            # a zombie for the lifetime of the server process, so a handful
+            # of timeouts exhausts the process table.
+            with contextlib.suppress(Exception):
+                await proc.wait()
             return {
                 "stdout": "",
                 "stderr": "Execution timed out",
@@ -388,7 +536,7 @@ async def synthesise(
 # ── Ingest endpoint (not a tool — used by the API layer) ─────────────────────
 
 
-async def ingest_document(text: str, metadata: dict | None = None) -> int:
+async def ingest_document(text: str, metadata: dict[str, Any] | None = None) -> int:
     """Called by the REST API to add documents to the knowledge base."""
     rag = _get_rag()
     return await rag.ingest(text, metadata)
@@ -398,11 +546,28 @@ async def ingest_document(text: str, metadata: dict | None = None) -> int:
 
 
 def run() -> None:
-    """Run the Cortex MCP server (stdio transport for local; SSE for remote)."""
-    import mcp
+    """Run the Cortex MCP server.
 
-    logger.info("mcp.server_starting", host=settings.mcp_host, port=settings.mcp_port)
-    mcp.run(transport="stdio")
+    `import mcp` used to sit at the top of this function, rebinding the name
+    of the module-level `FastMCP` instance to the `mcp` SDK package. The very
+    next line then called `mcp.run(...)` on the package, which has no such
+    attribute - so the `cortex-mcp` console script raised AttributeError on
+    every invocation and the MCP server could not be started at all.
+    """
+    transport = str(settings.mcp_transport)
+    configure_default_principal(transport)
+    logger.info(
+        "mcp.server_starting",
+        transport=transport,
+        host=settings.mcp_host,
+        port=settings.mcp_port,
+    )
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    elif transport == "http":
+        mcp.run(transport="http", host=settings.mcp_host, port=settings.mcp_port)
+    else:
+        mcp.run(transport="sse", host=settings.mcp_host, port=settings.mcp_port)
 
 
 if __name__ == "__main__":

@@ -256,7 +256,29 @@ class TestToolForwarding:
         router._cache.get.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_a_plain_call_still_uses_the_cache(self, tracker):
+    async def test_a_plain_scoped_call_still_uses_the_cache(self, tracker):
+        router = LLMRouter()
+        router._cost_tracker = tracker
+        router._cache = AsyncMock(get=AsyncMock(return_value=None), set=AsyncMock())
+
+        with patch("cortex.llm.router.acompletion", AsyncMock(return_value=_response())):
+            with patch("cortex.llm.router.completion_cost", return_value=0.001):
+                await router.complete(
+                    messages=[{"role": "user", "content": "hi"}],
+                    run_id="r",
+                    cache_scope="acme",
+                )
+        router._cache.get.assert_awaited()
+        assert router._cache.get.await_args.kwargs["scope"] == "acme"
+
+
+class TestCacheScoping:
+    """A semantic cache with no isolation boundary answers one tenant's
+    question with another tenant's answer. Absence of a scope must disable
+    the cache, not silently share it."""
+
+    @pytest.mark.asyncio
+    async def test_an_unscoped_call_does_not_read_the_cache(self, tracker):
         router = LLMRouter()
         router._cost_tracker = tracker
         router._cache = AsyncMock(get=AsyncMock(return_value=None), set=AsyncMock())
@@ -264,4 +286,38 @@ class TestToolForwarding:
         with patch("cortex.llm.router.acompletion", AsyncMock(return_value=_response())):
             with patch("cortex.llm.router.completion_cost", return_value=0.001):
                 await router.complete(messages=[{"role": "user", "content": "hi"}], run_id="r")
-        router._cache.get.assert_awaited()
+        router._cache.get.assert_not_awaited()
+        router._cache.set.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_cache_embeds_the_prompt_not_a_digest(self):
+        """The key used to be sha256(model + messages). Cosine similarity
+        between hex digests is noise, so the cache was neither semantic nor
+        safe."""
+        text = LLMRouter._cache_text(
+            [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "refund policy"},
+            ]
+        )
+        assert "refund policy" in text
+        assert "be terse" in text
+
+    @pytest.mark.asyncio
+    async def test_a_pricing_failure_does_not_fail_a_successful_completion(self, tracker):
+        """`completion_cost` raises for any model litellm has no pricing for,
+        including anything newer than the pinned release - which used to
+        discard a completion that had already been paid for."""
+        router = LLMRouter()
+        router._cost_tracker = tracker
+        router._cache = AsyncMock(get=AsyncMock(return_value=None), set=AsyncMock())
+
+        with patch("cortex.llm.router.acompletion", AsyncMock(return_value=_response())):
+            with patch(
+                "cortex.llm.router.completion_cost", side_effect=Exception("model not mapped")
+            ):
+                response = await router.complete(
+                    messages=[{"role": "user", "content": "hi"}], run_id="r"
+                )
+        assert response is not None
+        assert await tracker.get_run_cost("r") == pytest.approx(0.0)

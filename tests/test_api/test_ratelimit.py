@@ -7,6 +7,7 @@ read by nothing. Every test here would have failed against that.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
@@ -59,6 +60,12 @@ class TestRateLimiter:
         assert limiter.check("alice").allowed and limiter.check("alice").allowed
         assert limiter.check("alice").allowed is False
         assert limiter.check("bob").allowed is True
+
+    def test_concurrent_consumers_cannot_exceed_the_burst(self):
+        limiter = RateLimiter(per_minute=0.001, burst=5)
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            decisions = list(pool.map(lambda _: limiter.check("shared"), range(100)))
+        assert sum(decision.allowed for decision in decisions) == 5
 
 
 def _app(limiter: RateLimiter) -> TestClient:
@@ -117,3 +124,87 @@ class TestMiddleware:
         client = _app(RateLimiter(per_minute=60, burst=1))
         client.get("/v1/nope")
         assert client.get("/v1/nope").status_code == 429
+
+
+class TestBucketMapIsBounded:
+    """The bucket key is caller-controlled: an unauthenticated attacker picks
+    it by changing source address or token, so an unbounded map here is a
+    memory-exhaustion primitive that needs no credential."""
+
+    def test_bucket_count_never_exceeds_the_cap(self):
+        limiter = RateLimiter(per_minute=600, max_buckets=8)
+        for i in range(200):
+            limiter.check(f"anon:10.0.0.{i}")
+        assert limiter.bucket_count == 8
+
+    def test_eviction_is_least_recently_seen(self):
+        limiter = RateLimiter(per_minute=600, max_buckets=2)
+        limiter.check("a")
+        limiter.check("b")
+        limiter.check("a")  # a is now the most recent
+        limiter.check("c")  # evicts b
+
+        # A surviving bucket has been consumed from; an evicted one is fresh.
+        assert limiter.check("a").remaining < limiter.check("b").remaining
+
+    def test_an_evicted_principal_fails_open(self):
+        """Refusing new principals once full would let an attacker deny
+        service to every legitimate caller - the opposite of the goal."""
+        limiter = RateLimiter(per_minute=600, max_buckets=1)
+        limiter.check("victim")
+        limiter.check("attacker")
+        assert limiter.check("victim").allowed
+
+
+class TestPrincipalDerivation:
+    """`hash(token) & 0xFFFFFFFF` was the old key: 32 bits is ~77k tokens to a
+    coin-flip collision, colliding principals share an allowance, and `hash()`
+    on str is randomised per process."""
+
+    @staticmethod
+    def _request(headers: dict[str, str], host: str = "203.0.113.7"):
+        from starlette.datastructures import Headers
+        from starlette.requests import Request
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/runs",
+            "headers": Headers(headers).raw,
+            "client": (host, 12345),
+            "query_string": b"",
+        }
+        return Request(scope)
+
+    def test_the_raw_token_is_never_the_key(self):
+        secret = "eyJhbGciOi.super-secret-token.sig"
+        key = RateLimitMiddleware._principal(self._request({"authorization": f"Bearer {secret}"}))
+        assert secret not in key
+        assert key.startswith("token:")
+
+    def test_distinct_tokens_get_distinct_buckets(self):
+        keys = {
+            RateLimitMiddleware._principal(self._request({"authorization": f"Bearer t{i}"}))
+            for i in range(500)
+        }
+        assert len(keys) == 500
+
+    def test_the_key_is_stable_across_processes(self):
+        """blake2b, not `hash()`: with PYTHONHASHSEED randomisation the same
+        token keyed differently in every worker, so a caller got one
+        allowance per replica."""
+        import hashlib
+
+        token = "a-token"
+        key = RateLimitMiddleware._principal(self._request({"authorization": f"Bearer {token}"}))
+        assert key == f"token:{hashlib.blake2b(token.encode(), digest_size=16).hexdigest()}"
+
+    def test_no_token_buckets_by_peer_address(self):
+        key = RateLimitMiddleware._principal(self._request({}, host="198.51.100.4"))
+        assert key == "anon:198.51.100.4"
+
+    def test_an_empty_bearer_falls_back_to_the_peer(self):
+        key = RateLimitMiddleware._principal(
+            self._request({"authorization": "Bearer   "}, host="198.51.100.4")
+        )
+        assert key == "anon:198.51.100.4"
