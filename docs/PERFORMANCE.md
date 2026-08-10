@@ -5,16 +5,80 @@ Regenerate with `python -m perf.benchmark --write`. Enforced in CI by
 
 ## Measured
 
-6 concurrent clients x 25 iterations, ASGI in-process.
-Latencies in milliseconds.
+5 independent rounds, each 6 concurrent clients running
+25 iterations, ASGI in-process. Latencies in milliseconds.
+`p50`, `p95` and `p99` are the **median across rounds**; `samples` and `max`
+are pooled over all of them.
 
 | path | samples | p50 | p95 | p99 | max | budget p95/p99 |
 |---|---|---|---|---|---|---|
-| `health` | 150 | 1.56 | 2.39 | 3.45 | 3.49 | 15 / 40 |
-| `metrics` | 150 | 5.44 | 6.24 | 6.25 | 6.25 | 40 / 90 |
-| `unauthorised` | 150 | 3.17 | 3.45 | 4.21 | 4.21 | 20 / 50 |
-| `invalid_body` | 150 | 3.58 | 3.95 | 4.06 | 4.07 | 25 / 60 |
-| `rate_limited` | 150 | 0.93 | 1.16 | 1.25 | 1.27 | 20 / 50 |
+| `health` | 750 | 1.54 | 1.68 | 1.80 | 2.02 | 15 / 40 |
+| `metrics` | 750 | 5.42 | 6.21 | 6.26 | 6.71 | 40 / 90 |
+| `unauthorised` | 750 | 3.17 | 3.44 | 3.53 | 4.27 | 20 / 50 |
+| `invalid_body` | 750 | 3.53 | 3.89 | 4.09 | 4.54 | 25 / 60 |
+| `rate_limited` | 750 | 0.89 | 1.12 | 1.20 | 1.31 | 20 / 50 |
+
+Per-round p99, so the agreement between rounds is visible rather than
+smoothed away by the median:
+
+| path | p99 per round |
+|---|---|
+| `health` | 1.80, 1.62, 2.01, 1.87, 1.72 |
+| `metrics` | 6.70, 6.19, 6.36, 6.23, 6.26 |
+| `unauthorised` | 3.36, 3.51, 4.26, 3.58, 3.53 |
+| `invalid_body` | 4.05, 3.94, 4.09, 4.46, 4.20 |
+| `rate_limited` | 1.20, 1.15, 1.25, 1.18, 1.20 |
+
+## How it is measured, and why the harness is this careful
+
+The first version of this gate was red on every run, including on `main`,
+always on `unauthorised p99 ~230ms > 50ms` while p95 sat near 8ms. None of
+it was the code. Each of the following is a fix for a specific way the
+harness was measuring the runtime instead of the request.
+
+**The import-time heap is frozen before measuring.** Cortex's dependency
+closure leaves roughly 600k objects resident. A generation-2 collection
+walks all of them — 120ms on a developer machine, 230-285ms on a CI runner
+— and because the event loop is single-threaded, that pause is charged in
+full to whatever requests are in flight. Cyclic GC is triggered by
+allocation counts, and this workload is deterministic, so it fired at the
+same iteration in every CI run and hit the same path every time.
+`gc.freeze()` after warm-up moves that heap into the permanent generation.
+Collection stays **enabled** — objects allocated during measurement are
+still collected — so a change that starts producing garbage per request
+still shows up.
+
+**Every measured path is warmed, not just `/health`.** Warm-up and
+measurement iterate the same table of calls, so the two cannot drift apart
+again.
+
+**Log records go to memory for the duration.** The rate-limited path emits
+a warning per request; on CI stdout is a pipe owned by the runner agent, so
+each of those writes is a syscall that can block on another process inside
+the timed window. The records are still emitted, formatted and counted —
+the count is printed after every run — so logging added to a hot path is
+still paid for in latency and still visible.
+
+**The app under test is un-throttled explicitly, not by import order.**
+`RateLimitMiddleware` builds its limiter when the app is imported, so
+setting `API_RATE_LIMIT_PER_MINUTE` first only works when this module wins
+the import race. Where it does not, warm-up drains the bucket and every
+metered path answers 429 — the rate limiter measured under five other
+names. The harness installs its own limiter for the duration and puts the
+app's back afterwards.
+
+**The gate reads the median of several rounds.** Nearest-rank p99 over 150
+samples is the second-worst observation, so two contaminated samples decide
+the build. Collecting more samples in a single run does not help: stalls
+arrive at a rate, so a longer run collects proportionally more of them and
+contamination stays above the 99th percentile. Independent rounds do help —
+a stall must hit a majority of them to move the median, while a real
+regression slows every round. Budgets are unchanged and p99 is still
+enforced.
+
+The deliberate limit: a regression appearing in a minority of rounds is
+treated as noise. `max` is reported per path so a genuine rare stall is
+non-gating rather than invisible.
 
 ## Scope, and why it stops where it does
 
