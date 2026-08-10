@@ -162,9 +162,14 @@ class TestMCPCallEndpointStatusMapping:
     async def test_the_renamed_tool_is_reachable(self, client, auth_headers):
         """The allowlist named `summarize_document`, which does not exist, so
         the real tool `synthesise` was refused with a 404."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
-        with patch("cortex.mcp.server.synthesise", new=AsyncMock(return_value={"result": "ok"})):
+        async def fake_synthesise(
+            content: str, instruction: str, output_format: str = "markdown"
+        ) -> dict[str, str]:
+            return {"result": "ok"}
+
+        with patch("cortex.mcp.server.synthesise", new=fake_synthesise):
             from cortex.mcp.client import get_mcp_client
 
             get_mcp_client()._tools = {}
