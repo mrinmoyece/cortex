@@ -94,7 +94,7 @@ class CostTracker:
         """Return total USD spent in this run so far."""
         redis = await self._get_redis()
         key = f"{_COST_KEY_PREFIX}{run_id}"
-        entries = await cast("Awaitable[list[str]]", redis.lrange(key, 0, -1))
+        entries = await cast(Awaitable[list[str]], redis.lrange(key, 0, -1))
         total: float = sum(float(json.loads(e)["cost_usd"]) for e in entries)
         return total
 
@@ -102,7 +102,7 @@ class CostTracker:
         """Return a full cost breakdown for this run."""
         redis = await self._get_redis()
         key = f"{_COST_KEY_PREFIX}{run_id}"
-        raw = await cast("Awaitable[list[str]]", redis.lrange(key, 0, -1))
+        raw = await cast(Awaitable[list[str]], redis.lrange(key, 0, -1))
         entries = [json.loads(e) for e in raw]
         total_cost = sum(e["cost_usd"] for e in entries)
         total_prompt = sum(e["prompt_tokens"] for e in entries)

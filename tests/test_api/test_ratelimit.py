@@ -7,6 +7,7 @@ read by nothing. Every test here would have failed against that.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
@@ -59,6 +60,12 @@ class TestRateLimiter:
         assert limiter.check("alice").allowed and limiter.check("alice").allowed
         assert limiter.check("alice").allowed is False
         assert limiter.check("bob").allowed is True
+
+    def test_concurrent_consumers_cannot_exceed_the_burst(self):
+        limiter = RateLimiter(per_minute=0.001, burst=5)
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            decisions = list(pool.map(lambda _: limiter.check("shared"), range(100)))
+        assert sum(decision.allowed for decision in decisions) == 5
 
 
 def _app(limiter: RateLimiter) -> TestClient:

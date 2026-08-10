@@ -134,7 +134,7 @@ class RateLimiter:
                     self._buckets.popitem(last=False)
             else:
                 self._buckets.move_to_end(principal)
-        return bucket.consume()
+            return bucket.consume()
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
