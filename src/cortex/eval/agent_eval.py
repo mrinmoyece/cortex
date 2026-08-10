@@ -33,6 +33,7 @@ the one nobody installs.
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -206,11 +207,13 @@ class AgentEvaluator:
 
         if self._deepeval_available:
             try:
-                from deepeval.metrics import TaskCompletionMetric  # type: ignore[attr-defined]
-                from deepeval.test_case import LLMTestCase  # type: ignore[attr-defined]
+                task_completion_metric_cls = importlib.import_module(
+                    "deepeval.metrics"
+                ).TaskCompletionMetric
+                llm_test_case_cls = importlib.import_module("deepeval.test_case").LLMTestCase
 
-                metric = TaskCompletionMetric(threshold=0.7)
-                case = LLMTestCase(input=state.user_goal, actual_output=state.final_output)
+                metric = task_completion_metric_cls(threshold=0.7)
+                case = llm_test_case_cls(input=state.user_goal, actual_output=state.final_output)
                 metric.measure(case)
                 # `score` is None when deepeval could not reach its judge model.
                 if metric.score is None:
