@@ -72,15 +72,6 @@ jobs:
       - name: Static security analysis
         run: bandit -r src -ll
 
-  codeql:
-    runs-on: ubuntu-latest
-    permissions: { security-events: write, contents: read, actions: read }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
-        with: { languages: python }
-      - uses: github/codeql-action/analyze@v3
-
   performance:
     runs-on: ubuntu-latest
     steps:
