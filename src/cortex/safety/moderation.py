@@ -46,6 +46,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Protocol
 
 from cortex.exceptions import CortexError
 from cortex.logging_config import get_logger
@@ -190,9 +191,14 @@ _JAILBREAK_SIGNALS: list[tuple[re.Pattern[str], float, str]] = [
     (re.compile(r"</?(?:system|instructions?|assistant)>", re.I), 0.60, "injected control tag"),
 ]
 
-#: Zero-width and bidi characters, stripped before matching. "Ig​nore
-#: previous" defeats every pattern above unless normalisation runs first.
-_INVISIBLE = re.compile(r"[​-‏‪-‮⁠-⁤﻿]")
+#: Zero-width and bidi characters, stripped before matching. A zero-width
+#: space inside "ignore previous" defeats every pattern above unless
+#: normalisation runs first.
+#:
+#: Written as escapes, never as literals: a source file containing real
+#: bidi controls is itself a Trojan Source hazard (Bandit B613) - the
+#: rendered code can differ from what the compiler sees.
+_INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
 
 #: Above this, the input is refused.
 #:
@@ -282,10 +288,16 @@ def moderate_output(text: str) -> Verdict:
     return Verdict(allowed=True, layer="pattern")
 
 
+class Classifier(Protocol):
+    """The shape a pluggable moderation model has to satisfy."""
+
+    async def classify(self, text: str, direction: str) -> Verdict: ...
+
+
 class Moderator:
     """The layered check. Local layers always run; the classifier is optional."""
 
-    def __init__(self, classifier: object | None = None) -> None:
+    def __init__(self, classifier: Classifier | None = None) -> None:
         #: Any object with `async classify(text, direction) -> Verdict`.
         #: Left unset, only the local layers run - and `docs/GUARDRAILS.md`
         #: says so rather than implying a classifier is present.
@@ -317,7 +329,8 @@ class Moderator:
         if self._classifier is None:
             return fallback
         try:
-            return await self._classifier.classify(text, direction)  # type: ignore[attr-defined]
+            verdict: Verdict = await self._classifier.classify(text, direction)
+            return verdict
         except Exception as exc:
             # FAIL CLOSED. A cache that is down should be bypassed; a
             # moderator that is down must not be. Serving unmoderated output

@@ -75,6 +75,7 @@ class CriticAgent:
                 run_id=state.run_id,
                 temperature=0.0,
                 response_format={"type": "json_object"},
+                cache_scope=state.tenant_id,
                 metadata={"agent": "critic", "iteration": state.critique_iteration},
             )
             raw = response.choices[0].message.content or "{}"

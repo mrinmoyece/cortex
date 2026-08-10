@@ -25,9 +25,11 @@ Special edges:
 
 from __future__ import annotations
 
+import time
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -37,9 +39,17 @@ from cortex.agents.executor import ExecutorAgent
 from cortex.agents.memory_agent import MemoryAgent
 from cortex.agents.planner import PlannerAgent
 from cortex.config import settings
-from cortex.graph.state import CortexState, RunStatus
+from cortex.graph.state import CortexState, MemoryContext, RunStatus
 from cortex.logging_config import get_logger
-from cortex.obs.metrics import agent_run_duration, agent_runs_total, memory_consolidation_failures
+from cortex.obs.metrics import (
+    agent_iterations_per_run,
+    agent_run_duration,
+    agent_runs_total,
+    agent_tasks_per_run,
+    memory_consolidation_failures,
+    memory_retrieval_failures,
+    run_cost_usd,
+)
 
 logger = get_logger(__name__)
 
@@ -47,24 +57,41 @@ logger = get_logger(__name__)
 # ── Node functions ────────────────────────────────────────────────────────────
 
 
-async def load_memory_node(state: CortexState) -> dict:
-    """Retrieve relevant memory before planning begins."""
+async def load_memory_node(state: CortexState) -> dict[str, Any]:
+    """Retrieve relevant memory before planning begins.
+
+    Memory is an enhancement, never a precondition. A Redis or Qdrant blip
+    used to propagate out of this node and fail the run outright - the agent
+    could still have answered the question, it just would not have had
+    context. Degrading to an empty MemoryContext is the correct trade, and
+    the failure is logged and counted rather than hidden.
+    """
     agent = MemoryAgent()
-    memory_context = await agent.retrieve(
-        user_goal=state.user_goal,
-        session_id=state.session_id,
-        user_id=state.user_id,
-        # Threaded from state, not defaulted. The state has carried
-        # `tenant_id` since day one and the memory layer ignored it.
-        tenant_id=state.tenant_id,
-    )
+    try:
+        memory_context = await agent.retrieve(
+            user_goal=state.user_goal,
+            session_id=state.session_id,
+            user_id=state.user_id,
+            # Threaded from state, not defaulted. The state has carried
+            # `tenant_id` since day one and the memory layer ignored it.
+            tenant_id=state.tenant_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "memory.retrieval_failed",
+            run_id=state.run_id,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        memory_retrieval_failures.inc()
+        memory_context = MemoryContext()
     return {
         "memory_context": memory_context,
         "status": RunStatus.PLANNING,
     }
 
 
-async def planner_node(state: CortexState) -> dict:
+async def planner_node(state: CortexState) -> dict[str, Any]:
     """Decompose the user goal into an ordered task list."""
     agent = PlannerAgent()
     try:
@@ -79,7 +106,7 @@ async def planner_node(state: CortexState) -> dict:
         return {"status": RunStatus.FAILED, "error": f"Planning failed: {exc}"}
 
 
-async def executor_node(state: CortexState) -> dict:
+async def executor_node(state: CortexState) -> dict[str, Any]:
     """Execute the next pending task using MCP tools."""
     agent = ExecutorAgent()
     pending = state.pending_tasks()
@@ -122,7 +149,7 @@ async def executor_node(state: CortexState) -> dict:
         return {"tasks": updated_tasks}
 
 
-async def critic_node(state: CortexState) -> dict:
+async def critic_node(state: CortexState) -> dict[str, Any]:
     """Review the compiled output and decide: accept, reject, or escalate."""
     if not state.final_output:
         return {"status": RunStatus.FAILED, "error": "No output to critique"}
@@ -159,7 +186,7 @@ async def critic_node(state: CortexState) -> dict:
     }
 
 
-async def save_memory_node(state: CortexState) -> dict:
+async def save_memory_node(state: CortexState) -> dict[str, Any]:
     """Persist important facts and this run summary to memory stores.
 
     Failures here are swallowed on purpose, and the asymmetry is the point.
@@ -224,7 +251,26 @@ def route_after_critic(
 # ── Graph assembly ────────────────────────────────────────────────────────────
 
 
-def build_graph() -> CompiledStateGraph:
+def build_graph(*, human_review: bool | None = None) -> CompiledStateGraph[Any, Any, Any]:
+    """Compile the agent graph.
+
+    Args:
+        human_review: Suspend the graph before the critic so a human can
+            review the compiled output. Defaults to
+            `settings.human_review_before_critic`.
+
+            This is **off by default, deliberately**. It used to be
+            unconditional, which meant every single `run_cortex` call
+            suspended before the critic and returned a state that had never
+            been critiqued and whose memory had never been saved - while the
+            API reported the run as finished. A human-in-the-loop gate with
+            nothing on the other side of it is not a review step, it is a
+            silent truncation of every run. Turn it on only where something
+            actually resumes the thread (see docs/LIMITATIONS.md).
+    """
+    if human_review is None:
+        human_review = bool(settings.human_review_before_critic)
+
     builder = StateGraph(CortexState)
 
     # Nodes
@@ -267,11 +313,24 @@ def build_graph() -> CompiledStateGraph:
     checkpointer = MemorySaver()
     return builder.compile(
         checkpointer=checkpointer,
-        interrupt_before=["critic"],  # allow human-in-the-loop review point
+        interrupt_before=["critic"] if human_review else [],
     )
 
 
 # ── Run helper ────────────────────────────────────────────────────────────────
+
+
+def _status_label(status: RunStatus | str) -> str:
+    """Metric label for a run status.
+
+    `agent_runs_total.labels(status=state.status)` produced the label
+    "RunStatus.COMPLETED" - `RunStatus` is a `(str, Enum)`, and prometheus
+    stringifies the member, not its value. The literal "started" and "error"
+    labels emitted elsewhere in this function therefore did not share a
+    namespace with the terminal ones, and every dashboard filtering on
+    `status="completed"` matched nothing.
+    """
+    return status.value if isinstance(status, RunStatus) else str(status)
 
 
 async def run_cortex(
@@ -279,7 +338,7 @@ async def run_cortex(
     *,
     user_id: str,
     session_id: str | None = None,
-    context: dict | None = None,
+    context: dict[str, Any] | None = None,
     tenant_id: str = "default",
 ) -> CortexState:
     """
@@ -301,9 +360,7 @@ async def run_cortex(
     )
 
     graph = build_graph()
-    config = {"configurable": {"thread_id": run_id}}
-
-    import time
+    config: RunnableConfig = {"configurable": {"thread_id": run_id}}
 
     start = time.perf_counter()
     agent_runs_total.labels(status="started").inc()
@@ -311,16 +368,35 @@ async def run_cortex(
     try:
         final = await graph.ainvoke(initial_state, config=config)
         elapsed = time.perf_counter() - start
+
+        state = CortexState(**final)
+
+        # A compiled-in interrupt returns a state that has not reached the
+        # end of the graph. Reporting it as COMPLETED would be a lie, so the
+        # suspension is made explicit in the returned status.
+        snapshot = await graph.aget_state(config)
+        if getattr(snapshot, "next", ()):
+            state = state.model_copy(update={"status": RunStatus.AWAITING_HUMAN})
+            logger.info(
+                "run.suspended",
+                run_id=run_id,
+                next_nodes=list(snapshot.next),
+                latency_s=round(elapsed, 2),
+            )
+
         agent_run_duration.observe(elapsed)
-        agent_runs_total.labels(status=final["status"]).inc()
+        agent_runs_total.labels(status=_status_label(state.status)).inc()
+        agent_tasks_per_run.observe(len(state.tasks))
+        agent_iterations_per_run.observe(state.iteration_count)
+        run_cost_usd.observe(state.total_cost_usd)
         logger.info(
             "run.completed",
             run_id=run_id,
-            status=final["status"],
+            status=_status_label(state.status),
             latency_s=round(elapsed, 2),
-            cost_usd=final.get("total_cost_usd", 0),
+            cost_usd=state.total_cost_usd,
         )
-        return CortexState(**final)
+        return state
 
     except Exception as exc:
         elapsed = time.perf_counter() - start

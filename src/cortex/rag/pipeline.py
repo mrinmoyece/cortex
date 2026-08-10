@@ -13,10 +13,20 @@ Production-grade retrieval-augmented generation with:
 from __future__ import annotations
 
 import hashlib
+import time
+import uuid
+from typing import Any
 
 import litellm
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 from rank_bm25 import BM25Okapi
 
 from cortex.config import settings
@@ -28,13 +38,44 @@ from cortex.obs.tracing import observe
 logger = get_logger(__name__)
 
 
+#: Fixed namespace so a document's point id is stable across processes and
+#: releases. Regenerating this would orphan every previously ingested point.
+_DOC_NAMESPACE = uuid.UUID("6f1c2b4e-9c2d-5f7a-a1de-2b0c1d3e4f50")
+
+
+# ── Filters ───────────────────────────────────────────────────────────────────
+#
+# A filter is a plain payload equality map - `{"source": "handbook"}` - not
+# Qdrant's filter DSL. Callers used to hand the vector store a raw
+# `{"must": [...]}` document, which meant the filter could only ever be
+# understood by the dense path; BM25 had no way to apply it and silently
+# did not. A representation both retrievers can evaluate is what makes the
+# filter enforceable rather than decorative.
+
+
+def build_payload_filter(filters: dict[str, Any] | None) -> Filter | None:
+    """Translate a payload equality map into a Qdrant filter."""
+    if not filters:
+        return None
+    return Filter(
+        must=[FieldCondition(key=k, match=MatchValue(value=v)) for k, v in sorted(filters.items())]
+    )
+
+
+def matches_payload_filter(payload: dict[str, Any], filters: dict[str, Any] | None) -> bool:
+    """Evaluate the same equality map against an in-memory payload."""
+    if not filters:
+        return True
+    return all(payload.get(k) == v for k, v in filters.items())
+
+
 # ── Document model ────────────────────────────────────────────────────────────
 
 
 class Document:
     __slots__ = ("content", "embedding", "id", "metadata")
 
-    def __init__(self, content: str, metadata: dict | None = None) -> None:
+    def __init__(self, content: str, metadata: dict[str, Any] | None = None) -> None:
         self.content = content
         # Content-addressed, not random. `uuid.uuid4()` meant re-ingesting an
         # unchanged document produced entirely new point ids, so every
@@ -46,8 +87,13 @@ class Document:
         #
         # Chunk index is mixed in so two identical paragraphs in one document
         # remain distinct points.
+        # A UUID, not a hex digest. Qdrant point ids must be an unsigned
+        # integer or a UUID; a 64-character SHA-256 string is neither, so
+        # every upsert was rejected by the server. `uuid5` keeps the
+        # content-addressing (same content and chunk index -> same id) while
+        # producing an id Qdrant will actually accept.
         chunk_index = (metadata or {}).get("chunk_index", 0)
-        self.id = hashlib.sha256(f"{self.doc_hash}:{chunk_index}".encode()).hexdigest()
+        self.id = str(uuid.uuid5(_DOC_NAMESPACE, f"{self.doc_hash}:{chunk_index}"))
         self.metadata = metadata or {}
         self.embedding: list[float] | None = None
 
@@ -60,7 +106,7 @@ class RetrievedChunk:
     __slots__ = ("content", "doc_id", "metadata", "score", "source")
 
     def __init__(
-        self, doc_id: str, content: str, metadata: dict, score: float, source: str
+        self, doc_id: str, content: str, metadata: dict[str, Any], score: float, source: str
     ) -> None:
         self.doc_id = doc_id
         self.content = content
@@ -93,7 +139,7 @@ class SemanticChunker:
         self._max_size = max_chunk_size
         self._overlap = overlap
 
-    def chunk(self, text: str, metadata: dict | None = None) -> list[Document]:
+    def chunk(self, text: str, metadata: dict[str, Any] | None = None) -> list[Document]:
         """Split text into semantically coherent chunks."""
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         chunks: list[Document] = []
@@ -198,26 +244,29 @@ class VectorStore:
             )
 
     async def search(
-        self, query_vector: list[float], top_k: int, filters: dict | None = None
+        self, query_vector: list[float], top_k: int, filters: dict[str, Any] | None = None
     ) -> list[RetrievedChunk]:
         client = await self._get_client()
-        results = await client.search(
+        response = await client.query_points(
             collection_name=settings.qdrant_collection_rag,
-            query_vector=query_vector,
+            query=query_vector,
             limit=top_k,
-            query_filter=filters,
+            query_filter=build_payload_filter(filters),
             with_payload=True,
         )
-        return [
-            RetrievedChunk(
-                doc_id=str(r.id),
-                content=r.payload.get("content", ""),
-                metadata={k: v for k, v in r.payload.items() if k != "content"},
-                score=r.score,
-                source="dense",
+        chunks = []
+        for r in response.points:
+            payload: dict[str, Any] = r.payload or {}
+            chunks.append(
+                RetrievedChunk(
+                    doc_id=str(r.id),
+                    content=str(payload.get("content", "")),
+                    metadata={k: v for k, v in payload.items() if k != "content"},
+                    score=r.score,
+                    source="dense",
+                )
             )
-            for r in results
-        ]
+        return chunks
 
 
 # ── BM25 Sparse Retriever ────────────────────────────────────────────────────
@@ -236,25 +285,43 @@ class SparseRetriever:
     def index(self, documents: list[Document]) -> None:
         self._corpus = documents
         tokenised = [doc.content.lower().split() for doc in documents]
-        self._index = BM25Okapi(tokenised)
+        self._index = BM25Okapi(tokenised) if tokenised else None
 
-    def search(self, query: str, top_k: int) -> list[RetrievedChunk]:
+    def search(
+        self, query: str, top_k: int, filters: dict[str, Any] | None = None
+    ) -> list[RetrievedChunk]:
+        """Rank the in-memory corpus, honouring the same filters as dense search.
+
+        Filters used to be applied to the Qdrant query only. Sparse hits went
+        straight into the fusion unfiltered, so `source_filter="public"` was
+        trivially bypassable: ask a question whose terms match a restricted
+        document and BM25 hands it back. A filter enforced on one of two
+        retrieval paths is not a filter.
+        """
         if not self._index or not self._corpus:
             return []
         tokens = query.lower().split()
         scores = self._index.get_scores(tokens)
-        ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
-        return [
-            RetrievedChunk(
-                doc_id=self._corpus[i].id,
-                content=self._corpus[i].content,
-                metadata=self._corpus[i].metadata,
-                score=float(s),
-                source="sparse",
+        ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+        results = []
+        for i, s in ranked:
+            if s <= 0:
+                continue
+            doc = self._corpus[i]
+            if not matches_payload_filter(doc.metadata, filters):
+                continue
+            results.append(
+                RetrievedChunk(
+                    doc_id=doc.id,
+                    content=doc.content,
+                    metadata=doc.metadata,
+                    score=float(s),
+                    source="sparse",
+                )
             )
-            for i, s in ranked
-            if s > 0
-        ]
+            if len(results) >= top_k:
+                break
+        return results
 
 
 # ── Reranker ──────────────────────────────────────────────────────────────────
@@ -262,6 +329,23 @@ class SparseRetriever:
 
 class CohereReranker:
     """Cross-encoder reranker using Cohere's rerank-english-v3.0."""
+
+    def __init__(self) -> None:
+        self._co: Any = None
+
+    def _client(self) -> Any:
+        """One client for the life of the process.
+
+        A fresh `cohere.AsyncClient` per rerank call opens an httpx pool that
+        is never closed, so every retrieval leaked a connection pool and
+        eventually file descriptors.
+        """
+        if self._co is None:
+            import cohere
+
+            assert settings.cohere_api_key is not None
+            self._co = cohere.AsyncClient(settings.cohere_api_key.get_secret_value())
+        return self._co
 
     async def rerank(
         self,
@@ -274,9 +358,7 @@ class CohereReranker:
             return chunks[:top_k]
 
         try:
-            import cohere
-
-            co = cohere.AsyncClient(settings.cohere_api_key.get_secret_value())
+            co = self._client()
             results = await co.rerank(
                 model="rerank-english-v3.0",
                 query=query,
@@ -321,7 +403,7 @@ class RAGPipeline:
         self._all_docs: list[Document] = []  # For BM25 indexing
 
     @observe("rag.ingest")
-    async def ingest(self, text: str, metadata: dict | None = None) -> int:
+    async def ingest(self, text: str, metadata: dict[str, Any] | None = None) -> int:
         """
         Ingest a text document into the RAG pipeline.
         Returns the number of chunks created.
@@ -338,13 +420,29 @@ class RAGPipeline:
             embeddings = await self._embedder.embed_batch([c.content for c in batch])
             all_embeddings.extend(embeddings)
 
-        for chunk, embedding in zip(chunks, all_embeddings, strict=False):
+        # `strict=True`: a provider returning fewer embeddings than inputs
+        # used to silently leave the tail of the document unembedded and
+        # therefore unretrievable, with no error anywhere.
+        if len(all_embeddings) != len(chunks):
+            raise IngestionError(
+                f"Embedding count mismatch: {len(all_embeddings)} embeddings "
+                f"for {len(chunks)} chunks"
+            )
+        for chunk, embedding in zip(chunks, all_embeddings, strict=True):
             chunk.embedding = embedding
 
         await self._vector_store.upsert(chunks)
 
-        # Update BM25 index
+        # Update BM25 index. The corpus is bounded: it lives in this process
+        # for the lifetime of the process, so without a cap a long-running
+        # API worker grows until it is killed. Oldest chunks are dropped
+        # first - they remain in Qdrant and are still retrievable densely.
         self._all_docs.extend(chunks)
+        max_docs = int(settings.rag_max_indexed_chunks)
+        if len(self._all_docs) > max_docs:
+            dropped = len(self._all_docs) - max_docs
+            self._all_docs = self._all_docs[dropped:]
+            logger.warning("rag.bm25_corpus_trimmed", dropped=dropped, retained=max_docs)
         self._sparse.index(self._all_docs)
 
         rag_documents_ingested.inc(len(chunks))
@@ -356,13 +454,14 @@ class RAGPipeline:
         self,
         query: str,
         top_k: int | None = None,
-        filters: dict | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> list[RetrievedChunk]:
         """
         Hybrid retrieval: dense + sparse → RRF fusion → rerank.
-        """
-        import time
 
+        `filters` is a payload equality map (``{"source": "handbook"}``) and
+        is applied to *both* retrieval paths.
+        """
         top_k = top_k if top_k is not None else settings.rag_top_k_retrieve
         start = time.perf_counter()
 
@@ -370,7 +469,7 @@ class RAGPipeline:
             # Parallel dense + sparse search
             query_embedding = (await self._embedder.embed_batch([query]))[0]
             dense_task = self._vector_store.search(query_embedding, top_k=top_k, filters=filters)
-            sparse_results = self._sparse.search(query, top_k=top_k)
+            sparse_results = self._sparse.search(query, top_k=top_k, filters=filters)
             dense_results = await dense_task
 
             # Reciprocal Rank Fusion

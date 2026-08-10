@@ -12,11 +12,13 @@ Execution strategy:
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from cortex.graph.state import CortexState, Task
 from cortex.llm.router import get_router
 from cortex.logging_config import get_logger
 from cortex.mcp.client import get_mcp_client
+from cortex.mcp.server import Principal
 from cortex.obs.tracing import observe
 from cortex.safety.moderation import spotlight
 
@@ -74,6 +76,7 @@ class ExecutorAgent:
                 run_id=state.run_id,
                 temperature=0.0,
                 tools=tools,
+                cache_scope=state.tenant_id,
                 metadata={"agent": "executor", "task_id": task.id, "round": round_num},
             )
 
@@ -103,7 +106,7 @@ class ExecutorAgent:
                 tool_result = await self._call_mcp_tool(
                     tool_name=tool_call.function.name,
                     arguments=json.loads(tool_call.function.arguments),
-                    run_id=state.run_id,
+                    state=state,
                 )
                 messages.append(
                     {
@@ -133,14 +136,29 @@ class ExecutorAgent:
         cost_delta = state.total_cost_usd - cost_before
         return task.mark_failed("Exceeded maximum tool-call rounds"), cost_delta
 
-    async def _call_mcp_tool(self, tool_name: str, arguments: dict, run_id: str) -> dict:
-        """Delegate to MCP client, normalise errors into structured dicts."""
+    async def _call_mcp_tool(
+        self, tool_name: str, arguments: dict[str, Any], state: CortexState
+    ) -> dict[str, Any]:
+        """Delegate to MCP client, normalise errors into structured dicts.
+
+        The run's own identity is bound for the duration of the call. Without
+        this, principal binding existed only on the HTTP endpoint, so a graph
+        run - the main way tools are actually used - reached `query_memory`
+        with nothing bound and got a flat refusal. The identity comes from
+        `CortexState`, which took it from the authenticated request that
+        created the run; it is never taken from `arguments`, which the model
+        writes.
+        """
+        principal = Principal(user_id=state.user_id, tenant_id=state.tenant_id)
         try:
-            result = await self._mcp.call_tool(tool_name, arguments)
-            logger.debug("mcp.tool_called", tool=tool_name, run_id=run_id)
+            result = await self._mcp.call_tool(tool_name, arguments, principal=principal)
+            logger.debug("mcp.tool_called", tool=tool_name, run_id=state.run_id)
             return {"success": True, "result": result}
         except Exception as exc:
-            logger.warning("mcp.tool_error", tool=tool_name, error=str(exc), run_id=run_id)
+            logger.warning("mcp.tool_error", tool=tool_name, error=str(exc), run_id=state.run_id)
+            # Returned to the model rather than raised: a failed tool call is
+            # something the executor is expected to work around, and one bad
+            # call should not abandon a task that has two more rounds left.
             return {"success": False, "error": str(exc)}
 
     def _build_task_prompt(self, task: Task, state: CortexState) -> str:
@@ -183,6 +201,7 @@ class ExecutorAgent:
         response = await self._router.complete(
             messages=messages,
             run_id=state.run_id,
+            cache_scope=state.tenant_id,
             metadata={"agent": "executor", "phase": "compile"},
         )
         return response.choices[0].message.content or ""

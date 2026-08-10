@@ -53,9 +53,34 @@ import httpx
 # a measurement of the rate limiter rather than of the paths named.
 os.environ.setdefault("API_RATE_LIMIT_PER_MINUTE", "1000000")
 
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
+
 from cortex.api.auth import create_access_token
 from cortex.api.main import app
-from cortex.api.ratelimit import RateLimiter
+from cortex.api.ratelimit import RateLimiter, RateLimitMiddleware
+
+
+def _rejecting_app() -> Starlette:
+    """A minimal app whose limiter has no allowance left.
+
+    The 429 branch used to be timed by calling `RateLimiter.check()` in
+    process and recording the result under a name that implied an HTTP
+    path. That measured a dictionary lookup - it reported 0.00ms against a
+    20ms budget, so the budget could never fail and the row was decoration.
+    Rejecting through the middleware, over ASGI, measures what a throttled
+    client actually waits for: principal derivation, the bucket, and the
+    JSON response.
+    """
+
+    async def unreachable(request: object) -> PlainTextResponse:  # pragma: no cover
+        return PlainTextResponse("should never be reached")
+
+    limited = Starlette(routes=[Route("/api/v1/runs", unreachable, methods=["POST"])])
+    limited.add_middleware(RateLimitMiddleware, limiter=RateLimiter(per_minute=1, burst=0))
+    return limited
+
 
 DOC = Path(__file__).resolve().parents[1] / "docs" / "PERFORMANCE.md"
 
@@ -120,15 +145,22 @@ async def run(concurrency: int = 8, iterations: int = 40) -> dict[str, Measureme
     names = ("health", "metrics", "unauthorised", "invalid_body", "rate_limited")
     results = {n: Measurement(n) for n in names}
 
-    # A limiter with no allowance at all, used only to time the rejection
-    # path. The 429 branch is on every request once a client misbehaves, so
-    # it deserves a budget as much as the happy path does.
-    exhausted = RateLimiter(per_minute=1, burst=0)
+    # The 429 branch is on every request once a client misbehaves, so it
+    # deserves a budget as much as the happy path does.
+    rejecting = _rejecting_app()
 
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://bench", timeout=30.0
-    ) as client:
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://bench", timeout=30.0
+        ) as client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=rejecting),
+            base_url="http://bench",
+            timeout=30.0,
+        ) as throttled,
+    ):
         await client.get("/health")  # warm-up: lazy imports, not latency
+        await throttled.post("/api/v1/runs", json={"goal": "x"})
 
         async def one_user() -> None:
             for _ in range(iterations):
@@ -144,9 +176,11 @@ async def run(concurrency: int = 8, iterations: int = 40) -> dict[str, Measureme
                     lambda: client.post("/api/v1/runs", json={}, headers=auth),
                     (422,),
                 )
-                start = time.perf_counter()
-                exhausted.check("bench")
-                results["rate_limited"].samples.append((time.perf_counter() - start) * 1000)
+                await _timed(
+                    results["rate_limited"],
+                    lambda: throttled.post("/api/v1/runs", json={"goal": "x"}),
+                    (429,),
+                )
 
         await asyncio.gather(*(one_user() for _ in range(concurrency)))
 

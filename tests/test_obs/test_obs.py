@@ -71,3 +71,53 @@ class TestTracingDegradesGracefully:
         it must not double-register or throw."""
         m.configure_observability()
         m.configure_observability()
+
+
+class TestRunStatusMetricLabels:
+    """`agent_runs_total.labels(status=state.status)` emitted the label
+    "RunStatus.COMPLETED": `RunStatus` is a `(str, Enum)` and prometheus
+    stringifies the member, not its value. The "started" and "error" labels
+    emitted a few lines away were plain strings, so terminal and non-terminal
+    runs did not share a label namespace, and every dashboard panel filtering
+    on `status="completed"` matched nothing."""
+
+    def test_an_enum_member_yields_its_value(self):
+        from cortex.graph.cortex_graph import _status_label
+        from cortex.graph.state import RunStatus
+
+        assert _status_label(RunStatus.COMPLETED) == "completed"
+        assert "RunStatus" not in _status_label(RunStatus.COMPLETED)
+
+    def test_every_status_produces_a_lowercase_scalar(self):
+        from cortex.graph.cortex_graph import _status_label
+        from cortex.graph.state import RunStatus
+
+        for status in RunStatus:
+            label = _status_label(status)
+            assert label == label.lower()
+            assert "." not in label
+
+    def test_a_plain_string_passes_through(self):
+        """The literal "started" and "error" call sites must keep working."""
+        from cortex.graph.cortex_graph import _status_label
+
+        assert _status_label("started") == "started"
+        assert _status_label("error") == "error"
+
+
+class TestMetricCardinality:
+    """A `Gauge` labelled by `run_id` minted a permanent time series per run.
+    The classic cardinality mistake: invisible until Prometheus falls over
+    weeks later, during an unrelated incident."""
+
+    def test_no_metric_is_labelled_by_a_unique_identifier(self):
+        import cortex.obs.metrics as metrics_module
+
+        forbidden = {"run_id", "session_id", "user_id", "trace_id", "prompt"}
+        offenders = []
+        for name in dir(metrics_module):
+            metric = getattr(metrics_module, name)
+            labels = getattr(metric, "_labelnames", None)
+            if labels and forbidden & set(labels):
+                offenders.append((name, labels))
+        assert not offenders, f"unbounded label cardinality: {offenders}"

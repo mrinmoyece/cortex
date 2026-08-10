@@ -113,3 +113,39 @@ def mock_mcp_client():
         client.get_tool_schemas = AsyncMock(return_value=[])
         mock.return_value = client
         yield client
+
+
+# ── Settings override ─────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def override_settings():
+    """Temporarily override fields on the process-wide Settings object.
+
+    `get_settings()` is `lru_cache`d and every module holds the same
+    `_LazySettings` proxy over it, so patching a name is not enough - the
+    proxy resolves through the cached instance. Mutating and restoring that
+    instance is what actually changes what production code reads.
+    """
+    from cortex.config import get_settings
+
+    settings_obj = get_settings()
+    originals: dict[str, object] = {}
+
+    def _apply(**overrides: object) -> None:
+        for key, value in overrides.items():
+            if key not in originals:
+                originals[key] = getattr(settings_obj, key)
+            object.__setattr__(settings_obj, key, value)
+
+    try:
+        yield _apply
+    finally:
+        for key, value in originals.items():
+            object.__setattr__(settings_obj, key, value)
+
+
+@pytest.fixture
+def code_execution_enabled(override_settings):
+    override_settings(code_execution_enabled=True)
+    return True

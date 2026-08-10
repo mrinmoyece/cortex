@@ -60,7 +60,8 @@ A single context window can't hold everything a user has ever done. A single vec
 }
 ```
 
-**At retrieval:** Top 10 semantically similar facts fetched and injected into planner. Filter by `user_id` ensures isolation between users.
+**At retrieval:** Top 10 semantically similar facts fetched and injected into
+planner, filtered by **both `tenant_id` and `user_id`**.
 
 **Improving extraction:** The default `_extract_facts()` method is intentionally simple (task description + result text). For production, replace it with an LLM call:
 
@@ -119,6 +120,23 @@ MEMORY_CONSOLIDATION_THRESHOLD=10    # consolidate after 10 episodes
 
 ## Multi-tenancy
 
-Episodic memory is isolated by `user_id` (Redis key includes user_id).  
-Semantic memory is isolated by Qdrant filter (`user_id` field in payload).  
-Tenants never see each other's memories.
+Episodic memory is keyed `cortex:episodic:{tenant_id}:{user_id}` in Redis.
+Semantic memory is filtered on both `tenant_id` and `user_id` in the Qdrant
+payload.
+
+`tenant_id` used to be carried in `CortexState`, described here, and used by
+**neither tier** — both keyed on `user_id` alone. That is safe exactly as long
+as user ids are globally unique, which they are not when they arrive from
+tenant-local identity providers: two tenants with a `user_id` of `admin`
+shared one memory store. Both tiers now scope on the pair, and the retrieval
+filter is conjunctive, so a fact written under one tenant is unreachable from
+another.
+
+The identity comes from the authenticated caller, never from a tool argument
+or from the model — see [MCP.md](MCP.md#query_memory).
+
+**Migration note:** the Redis key layout changed. Episodic entries written
+before this change live under the old `cortex:episodic:{user_id}` keys and are
+not read any more. They expire on their existing TTL (7 days by default);
+there is no migration step, and nothing breaks — a user simply starts with an
+empty recent-run history.

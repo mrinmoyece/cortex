@@ -12,6 +12,7 @@ import warnings
 from enum import Enum
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
     AnyHttpUrl,
@@ -22,6 +23,11 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# `cortex.mcp.catalog` deliberately imports nothing from cortex, so naming it
+# here does not create a cycle. Validating the allowlist against the real
+# tool set is the only thing that stops the two drifting apart silently.
+from cortex.mcp.catalog import DEFAULT_HTTP_ALLOWLIST, TOOL_NAMES
 
 
 class Environment(str, Enum):
@@ -65,7 +71,7 @@ class Settings(BaseSettings):
     )
 
     # ── API ───────────────────────────────────────────────────────────────────
-    api_host: str = "0.0.0.0"  # noqa: S104 - a container binds all interfaces  # noqa: S104 - a container must bind all interfaces to be reachable
+    api_host: str = "0.0.0.0"  # a container binds all interfaces  # noqa: S104  # nosec B104
     api_port: int = 8000
     api_workers: int = 4
     #: Empty by default, and that means CORS is OFF - no browser origin is
@@ -74,27 +80,91 @@ class Settings(BaseSettings):
     #: the user happens to visit. Set explicit origins to enable it.
     api_cors_origins: list[AnyHttpUrl] = []
     api_rate_limit_per_minute: int = 60
+    #: Hard ceiling on the number of distinct principals the in-process rate
+    #: limiter tracks. The bucket map is keyed by caller identity, which an
+    #: unauthenticated attacker controls (source IP), so it is bounded and
+    #: evicted LRU rather than allowed to grow until the process dies.
+    api_rate_limit_max_buckets: int = 10_000
+    #: In-process run store bounds. `_runs` is a development-grade store:
+    #: per-process, non-durable, and therefore capped so that a long-lived
+    #: API process cannot be walked into an OOM by creating runs.
+    api_max_tracked_runs: int = 1_000
+    api_run_retention_seconds: int = 3_600
+    #: Optional bearer token for `GET /metrics`. Unset means the endpoint is
+    #: open, which is only appropriate when the port is not publicly routable.
+    metrics_token: SecretStr | None = None
     #: Read-only SQLite databases the `query_data` MCP tool may query, as
     #: "alias=/path/to.db,other=/path/other.db". Empty by default: a data
     #: tool with no configured source should refuse, not invent.
     sql_database_aliases: str = ""
 
     # ── MCP Server ────────────────────────────────────────────────────────────
-    mcp_host: str = "0.0.0.0"  # noqa: S104 - a container binds all interfaces
+    mcp_host: str = "0.0.0.0"  # a container binds all interfaces  # noqa: S104  # nosec B104
     mcp_port: int = 8001
+    #: Transport for the standalone `cortex-mcp` process. "stdio" is the MCP
+    #: default and is what an MCP client (Claude Desktop, an IDE) spawns; the
+    #: HTTP transports are what `mcp_host`/`mcp_port` apply to.
+    mcp_transport: str = "stdio"
+    #: `execute_code` runs a subprocess with this process's privileges. It is
+    #: NOT a sandbox (see docs/MCP.md), so it is off unless deliberately
+    #: enabled on a host where arbitrary code execution is already acceptable.
+    code_execution_enabled: bool = False
+    #: MCP tools reachable through `POST /api/v1/mcp/call`. Anything not listed
+    #: is refused, so adding a tool to the MCP server does not silently widen
+    #: the HTTP attack surface.
+    mcp_http_tool_allowlist: list[str] = Field(default_factory=lambda: list(DEFAULT_HTTP_ALLOWLIST))
+    #: Identity the standalone `cortex-mcp` process acts as, for tools that
+    #: touch a user's own data. Unset means those tools refuse.
+    #:
+    #: An MCP transport has no authentication of its own: over stdio the
+    #: client spawns the process, and over HTTP FastMCP serves every caller
+    #: alike. There is therefore no per-request identity to derive, and
+    #: inventing one would be worse than having none. What is honest is an
+    #: operator *declaring* whose data a single-tenant process may touch -
+    #: which is exactly the stdio case, where one process serves one desktop
+    #: client belonging to one person. See docs/MCP.md.
+    mcp_principal_user_id: str | None = None
+    mcp_principal_tenant_id: str = "default"
+
+    @field_validator("mcp_http_tool_allowlist")
+    @classmethod
+    def validate_http_allowlist(cls, v: list[str]) -> list[str]:
+        """Refuse an allowlist naming a tool that does not exist.
+
+        The default named `summarize_document`, which has never existed -
+        the tool is called `synthesise`. The effect was a 404 for a working
+        tool, and the failure mode of a *near*-miss is worse: a name the
+        dispatch table does not know produces a 500 from an endpoint that
+        already said the tool was allowed.
+        """
+        unknown = sorted(set(v) - TOOL_NAMES)
+        if unknown:
+            raise ValueError(
+                f"mcp_http_tool_allowlist names unknown tools: {unknown}. "
+                f"Known tools: {sorted(TOOL_NAMES)}"
+            )
+        return v
+
+    @field_validator("mcp_transport")
+    @classmethod
+    def validate_mcp_transport(cls, v: str) -> str:
+        allowed = {"stdio", "http", "sse"}
+        if v not in allowed:
+            raise ValueError(f"mcp_transport must be one of {sorted(allowed)}")
+        return v
 
     # ── Database ─────────────────────────────────────────────────────────────
     database_pool_size: int = 10
     database_max_overflow: int = 20
 
     # ── Redis ─────────────────────────────────────────────────────────────────
-    redis_url: RedisDsn = Field(default="redis://localhost:6379/0")
+    redis_url: RedisDsn = Field(default=RedisDsn("redis://localhost:6379/0"))
     redis_episodic_db: int = 1
     redis_cache_db: int = 2
     redis_celery_db: int = 3
 
     # ── Qdrant ────────────────────────────────────────────────────────────────
-    qdrant_url: AnyHttpUrl = Field(default="http://localhost:6333")
+    qdrant_url: AnyHttpUrl = Field(default=AnyHttpUrl("http://localhost:6333"))
     qdrant_api_key: SecretStr | None = None
     qdrant_collection_rag: str = "cortex_rag"
     qdrant_collection_memory: str = "cortex_memory"
@@ -129,17 +199,28 @@ class Settings(BaseSettings):
     rag_top_k_rerank: int = 5
     rag_bm25_weight: float = 0.3
     rag_dense_weight: float = 0.7
+    #: The in-process BM25 corpus is bounded. Sparse retrieval keeps every
+    #: chunk it has ever seen in memory and rebuilds the index on ingest, so
+    #: without a cap a long-lived API process grows without limit.
+    rag_max_indexed_chunks: int = 50_000
 
     # ── Memory ────────────────────────────────────────────────────────────────
     memory_episodic_ttl_seconds: int = 86_400 * 7  # 7 days
     memory_working_token_budget: int = 8_192
     memory_consolidation_threshold: int = 10  # episodes before consolidation
 
+    # ── Graph ─────────────────────────────────────────────────────────────────
+    #: Suspend the graph before the critic so a human can review the compiled
+    #: output. Off by default: nothing in this repository resumes a suspended
+    #: thread, so turning it on truncates every run before it is critiqued or
+    #: its memory is saved. See docs/LIMITATIONS.md.
+    human_review_before_critic: bool = False
+
     # ── Observability ─────────────────────────────────────────────────────────
     otel_exporter_endpoint: AnyHttpUrl | None = Field(
-        default="http://localhost:4317", description="OTLP gRPC endpoint"
+        default=AnyHttpUrl("http://localhost:4317"), description="OTLP gRPC endpoint"
     )
-    phoenix_endpoint: AnyHttpUrl = Field(default="http://localhost:6006")
+    phoenix_endpoint: AnyHttpUrl = Field(default=AnyHttpUrl("http://localhost:6006"))
     prometheus_port: int = 9090
 
     # ── Celery ────────────────────────────────────────────────────────────────
@@ -150,6 +231,28 @@ class Settings(BaseSettings):
     guardrails_enabled: bool = True
     pii_detection_enabled: bool = True
     injection_detection_enabled: bool = True
+    #: Presidio recognises far more than it should redact. Left to its
+    #: defaults it flags DATE_TIME, PERSON, LOCATION and URL, so "the annual
+    #: report" becomes "the <DATE_TIME> report" and the user's actual goal is
+    #: destroyed before an agent ever sees it. Only high-confidence
+    #: identifiers are redacted; extend deliberately, per deployment.
+    pii_entities: list[str] = [
+        "CREDIT_CARD",
+        "CRYPTO",
+        "EMAIL_ADDRESS",
+        "IBAN_CODE",
+        "IP_ADDRESS",
+        "MEDICAL_LICENSE",
+        "PHONE_NUMBER",
+        "UK_NHS",
+        "US_BANK_NUMBER",
+        "US_ITIN",
+        "US_PASSPORT",
+        "US_SSN",
+    ]
+    #: Presidio confidence floor. Below this a "detection" is a guess, and a
+    #: guess that rewrites the prompt is worse than a miss.
+    pii_score_threshold: float = 0.5
 
     @field_validator("secret_key")
     @classmethod
@@ -198,8 +301,21 @@ class Settings(BaseSettings):
     def redis_url_str(self) -> str:
         return str(self.redis_url)
 
+    def redis_url_for_db(self, db: int) -> str:
+        """Return `redis_url` pointed at logical database `db`.
 
-@lru_cache(maxsize=1)
+        Call sites used to do this with string surgery - `.replace("/0", ...)`
+        and `rsplit("/", 1)`. Both are wrong for real URLs: `.replace` rewrites
+        a "/0" appearing in a password or hostname, and `rsplit` on a URL with
+        no path (`redis://host:6379`) produces `redis://host:63791`. Parsing
+        the URL and replacing only the path component is the only version that
+        cannot silently point a worker at the wrong database - or the wrong
+        host.
+        """
+        parsed = urlsplit(str(self.redis_url))
+        return urlunsplit(parsed._replace(path=f"/{db}"))
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return the process-wide settings, constructed once.
@@ -207,7 +323,7 @@ def get_settings() -> Settings:
     Cached deliberately: sixteen modules ask for settings, and building a
     `BaseSettings` re-reads the environment and `.env` every time.
     """
-    return Settings()  # type: ignore[call-arg]
+    return Settings()
 
 
 class _LazySettings:

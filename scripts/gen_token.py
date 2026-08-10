@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # Load .env if present
 from dotenv import load_dotenv
+
 load_dotenv()
 
 from cortex.api.auth import create_access_token

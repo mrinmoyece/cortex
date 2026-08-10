@@ -4,14 +4,14 @@
 
 ### Prerequisites
 - Docker Desktop 4.x+ with at least 8GB RAM allocated
-- Python 3.11+ (for running scripts locally)
+- Python 3.10+ (for running scripts locally)
 - An LLM API key (OpenAI recommended to start)
 
 ### Steps
 
 ```bash
 # 1. Clone and configure
-git clone https://github.com/your-org/cortex
+git clone https://github.com/mrinmoyece/cortex.git
 cd cortex
 cp .env.example .env
 # Edit .env — at minimum set OPENAI_API_KEY and SECRET_KEY
@@ -31,7 +31,7 @@ curl http://localhost:8000/health
 
 # 6. Open observability UIs
 open http://localhost:6006   # Arize Phoenix (LLM traces)
-open http://localhost:3000   # Grafana (admin/cortex)
+open http://localhost:3000   # Grafana (admin / $GRAFANA_ADMIN_PASSWORD, "cortex" if unset)
 ```
 
 ### Useful commands
@@ -64,7 +64,13 @@ Cortex is designed for Kubernetes. The manifests in `deploy/k8s/` cover a produc
 - Kubernetes cluster (AKS / EKS / GKE / any)
 - `kubectl` configured for the cluster
 - Container registry (ACR / ECR / Artifact Registry)
-- Managed Redis, PostgreSQL, and a Qdrant instance
+- Managed Redis and a Qdrant instance
+
+> **These manifests have never been applied to a cluster.** They are
+> validated by YAML parsing and by checking that selectors match labels and
+> that every referenced ConfigMap/Secret key exists. Treat them as a
+> reviewed starting point, not a tested deployment. The worker liveness
+> probe (`celery inspect ping`) in particular is plausible and unverified.
 
 ### Build and push the image
 
@@ -105,7 +111,6 @@ kubectl get svc -n cortex
 | Component | AWS | Azure | GCP |
 |-----------|-----|-------|-----|
 | Redis | ElastiCache (Redis 7) | Azure Cache for Redis | Memorystore |
-| PostgreSQL | RDS PostgreSQL 16 | Azure Database for PostgreSQL | Cloud SQL |
 | Qdrant | Self-hosted on EKS / Qdrant Cloud | Qdrant Cloud | Qdrant Cloud |
 | Secrets | AWS Secrets Manager | Azure Key Vault | Secret Manager |
 | Container registry | ECR | ACR | Artifact Registry |
@@ -116,13 +121,10 @@ Update `deploy/k8s/service.yaml` ConfigMap with the managed service endpoints.
 
 The deployment uses `RollingUpdate` strategy with `maxUnavailable=0`. A Pod Disruption Budget ensures at least 1 replica is always available during node maintenance.
 
-For schema migrations, run Alembic before the new deployment:
-```bash
-kubectl run cortex-migrate --image=cortex:latest --restart=Never \
-  --env-from=configmap/cortex-config \
-  --env-from=secret/cortex-secrets \
-  -- alembic upgrade head
-```
+There are no schema migrations to run. Cortex has no relational database:
+state lives in Redis (memory, rate limits, cost counters, Celery) and Qdrant
+(vectors). A `DATABASE_URL` and a Postgres service used to be configured,
+documented and connected to by nothing; both are gone.
 
 ### Scaling
 
@@ -144,9 +146,52 @@ kubectl scale deployment cortex-worker --replicas=8 -n cortex
 | `OPENAI_API_KEY` | One provider required | — | OpenAI API key |
 | `ANTHROPIC_API_KEY` | | — | Anthropic API key |
 | `COHERE_API_KEY` | | — | Cohere API key (reranking) |
-| `DATABASE_URL` | ✅ | local default | PostgreSQL connection string |
 | `REDIS_URL` | ✅ | local default | Redis connection string |
 | `QDRANT_URL` | ✅ | local default | Qdrant HTTP endpoint |
 | `ENVIRONMENT` | | `local` | `local` / `staging` / `production` |
 | `MAX_COST_PER_RUN_USD` | | `2.00` | Hard spend limit per run |
 | `GUARDRAILS_ENABLED` | | `true` | Enable NeMo Guardrails |
+| `METRICS_TOKEN` | | unset | Bearer token required to scrape `/metrics`. Unset means the endpoint is **public** |
+| `CODE_EXECUTION_ENABLED` | | `false` | The `execute_code` MCP tool. Not a sandbox |
+| `MCP_TRANSPORT` | | `stdio` | `stdio` / `http` / `sse`. The HTTP transport is unauthenticated |
+| `MCP_HTTP_TOOL_ALLOWLIST` | | 4 tools | Tools reachable over `POST /api/v1/mcp/call`. Validated against the real tool set at startup |
+| `MCP_PRINCIPAL_USER_ID` | | unset | Identity a standalone **stdio** `cortex-mcp` acts as. Ignored on http/sse |
+| `API_RATE_LIMIT_PER_MINUTE` | | `60` | Per-principal request budget |
+| `API_MAX_TRACKED_RUNS` | | `1000` | In-memory run store cap (per process) |
+| `API_RUN_RETENTION_SECONDS` | | `3600` | How long a finished run stays pollable |
+| `HUMAN_REVIEW_BEFORE_CRITIC` | | `false` | Suspends the graph for approval. There is no resume endpoint yet |
+| `GRAFANA_ADMIN_PASSWORD` | | `cortex` | Compose-only; the Grafana admin password |
+
+The full annotated list is in [`.env.example`](../.env.example); the
+authoritative one is `src/cortex/config.py`.
+
+### Securing `/metrics`
+
+`/metrics` carries model names, spend totals and run volumes on the same port
+as the API, and it is **public when `METRICS_TOKEN` is unset**.
+
+The shipped Kubernetes manifests deliberately leave it unset. They scrape via
+the `prometheus.io/scrape` pod annotations, and annotation-based scraping
+sends no credential — so setting a token there does not secure the endpoint,
+it breaks the scrape. What protects it instead is the ingress rule, which
+refuses `/metrics` from outside the cluster; the `/` prefix rule would
+otherwise publish it to the internet alongside the API. Anything already
+inside the cluster can still reach it. Restricting that needs a NetworkPolicy
+scoped to your monitoring namespace, which is not shipped because an untested
+one silently stops the scrape.
+
+To require a token instead, set `METRICS_TOKEN` in the Secret **and** give
+Prometheus the matching credential — which means a scrape config rather than
+an annotation, with the same Secret mounted into the Prometheus pod:
+
+```yaml
+scrape_configs:
+  - job_name: cortex-api
+    kubernetes_sd_configs: [{role: pod}]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/cortex/METRICS_TOKEN
+```
+
+Doing one half of that is worse than doing neither: the dashboards go blank,
+and the first person to debug it deletes the token.

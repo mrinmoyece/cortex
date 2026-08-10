@@ -28,10 +28,19 @@ spec:
         prometheus.io/path: "/metrics"
         prometheus.io/port: "8000"
     spec:
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        # readOnlyRootFilesystem below leaves the process with nowhere to
+        # write; Python, litellm and tokenizer downloads all use /tmp, so
+        # without this the pod crashes on the first temp file.
+        - name: tmp
+          emptyDir: {}
       containers:
         - name: cortex-api
           image: cortex:latest
@@ -65,6 +74,9 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 5
             failureThreshold: 2
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -93,6 +105,19 @@ spec:
         app: cortex
         component: worker
     spec:
+      automountServiceAccountToken: false
+      # The worker ran as root with a writable root filesystem and no probes
+      # while the API next to it was hardened. It executes the same agent
+      # code and holds the same secrets, so it gets the same treatment.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: tmp
+          emptyDir: {}
       containers:
         - name: cortex-worker
           image: cortex:latest
@@ -110,6 +135,25 @@ spec:
             limits:
               cpu: "2000m"
               memory: "4Gi"
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - celery -A cortex.workers.celery_app inspect ping -d "celery@${HOSTNAME}"
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      terminationGracePeriodSeconds: 60
 
 ---
 apiVersion: apps/v1
@@ -129,10 +173,23 @@ spec:
         app: cortex
         component: beat
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        # beat writes its schedule database, so it needs a writable path even
+        # though the rest of the filesystem is read-only.
+        - name: tmp
+          emptyDir: {}
       containers:
         - name: cortex-beat
           image: cortex:latest
-          command: ["celery", "-A", "cortex.workers.celery_app", "beat", "--loglevel=info"]
+          command: ["celery", "-A", "cortex.workers.celery_app", "beat", "--loglevel=info",
+                    "--schedule=/tmp/celerybeat-schedule"]
           envFrom:
             - configMapRef:
                 name: cortex-config
@@ -145,3 +202,11 @@ spec:
             limits:
               cpu: "200m"
               memory: "256Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

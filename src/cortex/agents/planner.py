@@ -34,7 +34,7 @@ Rules:
 1. Maximum 8 tasks. Every task must be essential.
 2. Each task must have a unique `id` (short slug, e.g. "fetch_data").
 3. List tasks in execution order. Use `depends_on` to declare dependencies — executor uses this for parallelism.
-4. For each task, suggest the best `tool` from: [search_knowledge, query_memory, execute_code, query_data, web_search, synthesise]. Use null if no specific tool is needed.
+4. For each task, suggest the best `tool` from: [search_knowledge, query_memory, query_data, synthesise]. Use null if no specific tool is needed.
 5. Tasks should be atomic — one clear action each.
 6. Do NOT include meta-tasks like "plan the work" or "summarise". Only concrete actions.
 
@@ -76,6 +76,8 @@ class PlannerAgent:
             run_id=state.run_id,
             temperature=0.0,  # Deterministic planning
             response_format={"type": "json_object"},
+            # Cache hits never cross a tenant boundary.
+            cache_scope=state.tenant_id,
             metadata={"agent": "planner", "session_id": state.session_id},
         )
 

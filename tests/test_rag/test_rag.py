@@ -153,3 +153,93 @@ class TestDocumentModel:
     def test_metadata_defaults_to_empty_dict(self):
         doc = Document("content")
         assert doc.metadata == {}
+
+
+class TestDocumentIdIsAcceptableToQdrant:
+    """Qdrant accepts only UUIDs or unsigned integers as point IDs. `Document.id`
+    was a 64-character SHA-256 hex digest, which is neither, so the server
+    rejected every upsert - ingestion could not have worked against a real
+    instance, and no test reached one."""
+
+    def test_the_id_is_a_valid_uuid(self):
+        import uuid
+
+        uuid.UUID(Document("content").id)  # raises if it is not
+
+    def test_content_addressing_survived_the_change(self):
+        assert Document("same").id == Document("same").id
+        assert Document("same").id != Document("other").id
+
+
+class TestSparseRetrievalHonoursFilters:
+    """Dense search enforced `filters`; sparse did not. A filtered hybrid
+    search therefore returned unfiltered BM25 hits - in a multi-tenant
+    deployment, another tenant's documents. A filter enforced on one of two
+    retrieval paths is not a filter."""
+
+    @staticmethod
+    def _indexed() -> SparseRetriever:
+        retriever = SparseRetriever()
+        retriever.index(
+            [
+                Document("the refund policy allows returns", metadata={"tenant": "acme"}),
+                Document("refunds go to the original card", metadata={"tenant": "globex"}),
+                Document("shipping runs on weekdays only", metadata={"tenant": "acme"}),
+                Document("the warehouse closes at six", metadata={"tenant": "globex"}),
+            ]
+        )
+        return retriever
+
+    def test_a_filter_excludes_other_tenants(self):
+        hits = self._indexed().search("refund policy", top_k=10, filters={"tenant": "acme"})
+        assert hits
+        assert all(h.metadata.get("tenant") == "acme" for h in hits)
+
+    def test_the_same_query_unfiltered_does_reach_the_other_tenant(self):
+        """Without this the filtered case above proves nothing - the excluded
+        document has to be one BM25 would otherwise have returned."""
+        tenants = {
+            h.metadata.get("tenant") for h in self._indexed().search("refund refunds", top_k=10)
+        }
+        assert tenants == {"acme", "globex"}
+
+    def test_a_filter_matching_nothing_returns_nothing(self):
+        assert (
+            self._indexed().search("refund refunds", top_k=10, filters={"tenant": "nobody"}) == []
+        )
+
+    def test_filters_are_conjunctive(self):
+        retriever = SparseRetriever()
+        retriever.index(
+            [
+                Document("alpha topic", metadata={"tenant": "acme", "src": "wiki"}),
+                Document("beta topic", metadata={"tenant": "acme", "src": "pdf"}),
+                Document("gamma matter", metadata={"tenant": "globex", "src": "wiki"}),
+            ]
+        )
+        assert retriever.search("alpha", top_k=5, filters={"tenant": "acme", "src": "wiki"})
+        assert not retriever.search("alpha", top_k=5, filters={"tenant": "acme", "src": "pdf"})
+
+
+class TestPayloadFilterHelpers:
+    """The dense and sparse sides must apply the *same* predicate, or a hybrid
+    result set is filtered differently depending on which retriever found the
+    chunk."""
+
+    def test_an_empty_filter_is_no_filter(self):
+        from cortex.rag.pipeline import build_payload_filter, matches_payload_filter
+
+        assert build_payload_filter(None) is None
+        assert build_payload_filter({}) is None
+        assert matches_payload_filter({"a": 1}, None) is True
+
+    def test_both_halves_agree_on_the_keys_they_enforce(self):
+        from cortex.rag.pipeline import build_payload_filter, matches_payload_filter
+
+        filters = {"tenant": "acme", "src": "wiki"}
+        built = build_payload_filter(filters)
+        assert built is not None
+        assert {c.key for c in built.must} == set(filters)  # type: ignore[union-attr]
+        assert matches_payload_filter(filters, filters) is True
+        assert matches_payload_filter({"tenant": "acme"}, filters) is False
+        assert matches_payload_filter({}, filters) is False

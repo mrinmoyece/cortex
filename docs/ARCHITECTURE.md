@@ -69,17 +69,29 @@ Cortex is a production MCP-native agentic platform. The design follows one rule:
 - `executor` — calls MCP tools to complete each task; handles retries
 - `critic` — scores output quality; triggers replanning if below threshold
 - `save_memory` — persists run summary and extracted facts
-- `interrupt_before=["critic"]` enables human-in-the-loop review
+- `build_graph(human_review=True)` (or `HUMAN_REVIEW_BEFORE_CRITIC=true`) adds
+  `interrupt_before=["critic"]` for human-in-the-loop review. It is **off by
+  default**: the interrupt was unconditional, and with no resume endpoint
+  anywhere every run stopped half-done and was then reported as `COMPLETED`.
+  When it is on, a suspended run is reported as `awaiting_human`
 
 ### MCP Server (`src/cortex/mcp/`)
-- FastMCP server exposing 5 tools: search_knowledge, query_memory, execute_code, query_data, synthesise
+- FastMCP server exposing 5 tools: `search_knowledge`, `query_memory`,
+  `query_data`, `synthesise`, and `execute_code` (disabled by default; not a
+  sandbox)
+- Memory tools take no identity argument — it is bound from the authenticated
+  principal, and an unbound call is refused
 - Tools are the same functions called by the API and agents — no duplication
 - Runs as a separate process; connects to agent graph via MCPClient
 
 ### RAG Pipeline (`src/cortex/rag/`)
 - Ingestion: text → semantic chunks → embeddings → Qdrant + BM25 index
 - Retrieval: query → parallel dense (Qdrant) + sparse (BM25) → RRF fusion → Cohere rerank
-- Evaluation: Ragas pipeline measuring faithfulness, context precision, answer relevancy
+- Evaluation: Ragas pipeline measuring faithfulness, context precision, answer
+  relevancy, falling back to an LLM judge when the optional `eval` extra is
+  absent
+- Filters are enforced on **both** retrieval paths; the sparse half used to
+  ignore them, which made a filtered hybrid search silently unfiltered
 
 ### Memory System (`src/cortex/agents/memory_agent.py`)
 - WorkingMemory: in-process, token-budget aware
@@ -153,13 +165,21 @@ Cortex is a production MCP-native agentic platform. The design follows one rule:
 - API and Workers run as Kubernetes Deployments (HPA configured)
 - Qdrant: managed cloud or self-hosted StatefulSet
 - Redis: AWS ElastiCache / Azure Cache for Redis
-- PostgreSQL: AWS RDS / Azure Database for PostgreSQL
 - Observability: self-hosted Phoenix + Grafana, or Arize Cloud + Grafana Cloud
 
 ## Security Model
 
-- **Authentication:** JWT tokens (HS256, 1-hour expiry) + API keys for service-to-service
-- **Authorisation:** User-scoped runs — users can only read their own runs
+- **Authentication:** JWT tokens (HS256, 1-hour expiry), verified with PyJWT
+  requiring `exp` and `sub`. A token missing either, expired, or signed with
+  another key is a 401, not a 500
+- **Authorisation:** User-scoped runs — users can only read their own runs.
+  MCP tool calls made through the API are bound to the caller's principal, and
+  the tools that touch memory take no identity argument
+- **Rate limiting:** per-principal token bucket, applied before routing, with a
+  bounded bucket map (the key is caller-controlled, so an unbounded one is a
+  memory-exhaustion primitive that needs no credential)
+- **Metrics:** `/metrics` is bearer-authenticated when `METRICS_TOKEN` is set,
+  and public when it is not
 - **Network:** All inter-service traffic within the `cortex-net` Docker network; no external ports except API (8000) and observability UIs
 - **Container:** Non-root user (`cortex:cortex`, UID 1000), read-only root filesystem
 - **Secrets:** Never in environment variables directly in production — use AWS Secrets Manager / Azure Key Vault, injected as K8s secrets

@@ -51,6 +51,7 @@ llm_cost_total = Counter(
 llm_cache_hits_total = Counter(
     "cortex_llm_cache_hits_total",
     "Number of LLM calls served from semantic cache",
+    labelnames=["model"],
 )
 
 llm_errors_total = Counter(
@@ -106,11 +107,6 @@ rag_retrieval_duration = Histogram(
 rag_documents_ingested = Counter(
     "cortex_rag_documents_ingested_total",
     "Number of document chunks ingested into RAG pipeline",
-)
-
-rag_cache_hits_total = Counter(
-    "cortex_rag_cache_hits_total",
-    "RAG retrieval results served from cache",
 )
 
 # Memory
@@ -190,6 +186,12 @@ memory_consolidation_failures = Counter(
     "cortex_memory_consolidation_failures_total",
     "Runs whose memory write failed after the answer was produced. Degraded, "
     "not failed - but a rising rate means the agent stops learning.",
+)
+
+memory_retrieval_failures = Counter(
+    "cortex_memory_retrieval_failures_total",
+    "Runs that started with no memory context because a memory store was "
+    "unavailable. Degraded, not failed - the agent answers without history.",
 )
 
 run_cost_usd = Histogram(

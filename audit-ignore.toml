@@ -1,0 +1,26 @@
+# Dependency audit exceptions
+#
+# `scripts/audit.py` reads this file. Every entry needs an `id`, a `reason`
+# explaining why the advisory does not apply to Cortex or cannot be acted on
+# here, and a `review_by` date. The script refuses to run if any of those are
+# missing, so an exception cannot be added without someone stating why.
+#
+# There are currently no exceptions: a clean install of Cortex's dependency
+# closure - runtime or `[dev]` - reports no known vulnerabilities. Advisories
+# were removed by fixing the dependencies rather than by silencing them:
+#
+#   * python-jose was replaced with PyJWT, dropping `ecdsa` and its unfixed
+#     timing-attack advisory (PYSEC-2026-1325).
+#   * presidio-anonymizer was removed as unused; it pinned cryptography<49
+#     and held three fixed advisories out of reach.
+#   * ragas and deepeval moved to the optional `eval` extra, taking diskcache
+#     (PYSEC-2026-2447, no fix) and pillow out of the runtime closure.
+#
+# Format:
+#
+# [[ignore]]
+# id = "PYSEC-0000-0"
+# reason = "why this does not apply, or why it cannot be fixed here"
+# review_by = "2026-01-01"
+
+ignore = []

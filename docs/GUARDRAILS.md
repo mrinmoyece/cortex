@@ -36,16 +36,45 @@ Blocks patterns that attempt to override agent behaviour:
 
 ## PII Detection
 
-Uses [Microsoft Presidio](https://microsoft.github.io/presidio/) for entity recognition. Detects:
+Two engines, **unioned** — [Microsoft Presidio](https://microsoft.github.io/presidio/)
+for statistical NER, plus a local regex set. Together they detect:
+
 - Email addresses, phone numbers (UK + US)
 - UK National Insurance numbers
 - US Social Security Numbers
 - Credit card numbers
+- IP addresses
+
+The two used to be *mutually exclusive*: Presidio if importable, regex
+otherwise. That inverted the intent, because installing Presidio silently
+**removed** credit-card and UK NINO coverage — its English configuration
+ships no recogniser for either. Detection got weaker as you added the
+heavier dependency, and only a test running on a machine that happened to
+have Presidio installed showed it. Both engines now run and their spans are
+merged, with overlapping detections collapsed to the longest, highest-scoring
+one so two engines finding the same phone number produce one redaction rather
+than a redaction nested inside a redaction.
+
+Presidio's default entity set is also deliberately **not** used. It classifies
+"annual" as a `DATE_TIME` and "Q3" as a location, so `PII_ENTITIES` restricts
+it to the entities Cortex actually cares about, and `PII_SCORE_THRESHOLD`
+(0.6 by default) discards low-confidence hits. Without both, ordinary
+business questions came back with words redacted out of the user's goal —
+which is how a safety layer gets switched off.
 
 On detection in **input**: redact and continue (don't block — users may legitimately reference their own data).  
 On detection in **output**: always redact before returning to user.
 
-**Custom entities:** Add patterns to `PIIScanner._PATTERNS` for domain-specific PII (employee IDs, case numbers, etc.).
+Redactions are typed placeholders (`[EMAIL_REDACTED]`, `[CREDIT_CARD_REDACTED]`)
+rather than a uniform mask, so a downstream reader can tell what was removed
+without seeing it.
+
+**Custom entities:** Add patterns to `PIIScanner._PATTERNS` for domain-specific PII (employee IDs, case numbers, etc.), and add the entity name to `PII_ENTITIES` if it comes from Presidio.
+
+**What this is not.** Regex-detectable PII is the PII that has a format.
+Names, addresses and free-text disclosures are Presidio's job, and Presidio is
+a statistical model with a false-negative rate. Neither engine is a
+compliance control; see [LIMITATIONS.md](LIMITATIONS.md).
 
 ## NeMo Guardrails
 
@@ -92,6 +121,17 @@ INJECTION_DETECTION_ENABLED=false
 ```
 
 Never disable safety in production.
+
+## Related settings
+
+| Setting | Default | Effect |
+|---|---|---|
+| `PII_DETECTION_ENABLED` | `true` | Runs both the Presidio and regex scanners |
+| `PII_ENTITIES` | curated list | Which Presidio entities count; keeps "annual" from being redacted as a date |
+| `PII_SCORE_THRESHOLD` | `0.6` | Presidio confidence floor |
+| `INJECTION_DETECTION_ENABLED` | `true` | Scored jailbreak detection on input |
+| `GUARDRAILS_ENABLED` | `true` | Loads the NeMo Colang rails if the package and `config/rails` are present |
+| `CODE_EXECUTION_ENABLED` | `false` | The `execute_code` MCP tool. Not a sandbox — see [LIMITATIONS.md](LIMITATIONS.md) |
 
 
 ## The layers, and what each is actually worth

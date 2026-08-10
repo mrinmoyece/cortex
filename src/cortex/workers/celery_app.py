@@ -32,10 +32,16 @@ logger = get_task_logger(__name__)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
+#: `.replace("/0", ...)` was doing this, which rewrites any "/0" anywhere in
+#: the URL - including inside a password - and silently does nothing at all
+#: when REDIS_URL has no `/0` path. Both failure modes point the broker
+#: somewhere unintended without an error.
+_CELERY_REDIS_URL = settings.redis_url_for_db(settings.redis_celery_db)
+
 celery_app = Celery(
     "cortex",
-    broker=str(settings.redis_url).replace("/0", f"/{settings.redis_celery_db}"),
-    backend=str(settings.redis_url).replace("/0", f"/{settings.redis_celery_db}"),
+    broker=_CELERY_REDIS_URL,
+    backend=_CELERY_REDIS_URL,
 )
 
 celery_app.conf.update(
@@ -72,8 +78,18 @@ celery_app.conf.beat_schedule = {
 
 
 def _run_async(coro: Coroutine[Any, Any, T]) -> T:
-    """Run an async coroutine from a synchronous Celery task."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """Run a coroutine from a synchronous Celery task.
+
+    `asyncio.get_event_loop()` is deprecated when there is no running loop
+    (DeprecationWarning since 3.12, and slated for removal); in a prefork
+    Celery worker there never is one. It also returned a loop that was never
+    closed, so every task leaked its selector and any transports left open
+    by aiohttp/httpx clients.
+
+    `asyncio.run` creates a loop, runs the coroutine, cancels stragglers,
+    shuts down async generators, and closes the loop.
+    """
+    return asyncio.run(coro)
 
 
 @celery_app.task(
@@ -84,7 +100,13 @@ def _run_async(coro: Coroutine[Any, Any, T]) -> T:
     name="cortex.workers.celery_app.run_agent_task",
 )
 def run_agent_task(
-    self: Task, run_id: str, goal: str, user_id: str, session_id: str, context: dict
+    self: Task,
+    run_id: str,
+    goal: str,
+    user_id: str,
+    session_id: str,
+    context: dict[str, Any],
+    tenant_id: str = "default",
 ) -> dict[str, Any]:
     """Execute an Cortex agent run. Called when the API receives a run request."""
     logger.info(f"Starting agent run {run_id}")
@@ -97,6 +119,7 @@ def run_agent_task(
                 user_id=user_id,
                 session_id=session_id,
                 context=context,
+                tenant_id=tenant_id,
             )
         )
         logger.info(f"Run {run_id} completed: {state.status.value}")
@@ -114,7 +137,7 @@ def run_agent_task(
     queue="ingest",
     name="cortex.workers.celery_app.ingest_document_task",
 )
-def ingest_document_task(text: str, metadata: dict) -> dict[str, Any]:
+def ingest_document_task(text: str, metadata: dict[str, Any]) -> dict[str, Any]:
     """Ingest a document into the RAG pipeline in the background."""
     from cortex.rag.pipeline import RAGPipeline
 

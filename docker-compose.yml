@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Cortex full local stack
 #
@@ -20,8 +18,10 @@ x-cortex-common: &cortex-common
     context: .
     dockerfile: Dockerfile
   env_file: .env
+  # The mapping key was missing on the first entry, which made this file
+  # invalid YAML - `docker compose up` failed before starting anything, so
+  # the documented quickstart could never have worked.
   depends_on:
-      condition: service_healthy
     redis:
       condition: service_healthy
     qdrant:
@@ -48,6 +48,10 @@ services:
   cortex-mcp:
     <<: *cortex-common
     command: cortex-mcp
+    environment:
+      # The default transport is stdio, which exits immediately with no
+      # attached client. A container has to speak HTTP to be reachable.
+      MCP_TRANSPORT: http
     ports:
       - "8001:8001"
 
@@ -69,7 +73,9 @@ services:
     command: celery -A cortex.workers.celery_app flower --port=5555
     env_file: .env
     ports: ["5555:5555"]
-    depends_on: [redis]
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     networks: [cortex-net]
 
@@ -115,6 +121,10 @@ services:
     image: prom/prometheus:latest
     volumes:
       - ./obs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # prometheus.yml declares this rule file; without the mount Prometheus
+      # starts with zero alerting rules and every alert in obs/alerts.yaml is
+      # silently inert.
+      - ./obs/alerts.yaml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -127,7 +137,7 @@ services:
   grafana:
     image: grafana/grafana:latest
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: cortex
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-cortex}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/cortex.json
     volumes:

@@ -6,15 +6,20 @@ Cortex uses a layered test strategy. Tests at each layer have different scope, s
 
 ```
                     ┌─────────────────────┐
-                    │   Eval Regression   │  Ragas quality gate — runs on CI + every 6h
+                    │   Eval Regression   │  Ragas / LLM-judge suite — run on demand, not a CI gate
                     ├─────────────────────┤
-                    │  Integration Tests  │  Full graph runs with mocked LLM + real stores
+                    │  Integration Tests  │  Full graph runs with a mocked router and faked stores
                     ├─────────────────────┤
                     │     Unit Tests      │  Fast, isolated, all external calls mocked
                     └─────────────────────┘
 ```
 
 **Coverage target:** 80% minimum, enforced in `pyproject.toml`.
+
+**The suite needs no services.** Redis is faked, Qdrant and every HTTP client
+are mocked, and no test makes a network call. `pytest` runs on a clean laptop
+with nothing installed but the dev extra. `tests/eval/` holds regression
+*fixtures* for the evaluation harness, not tests — pytest does not collect it.
 
 ## Running Tests
 
@@ -65,7 +70,12 @@ Key cases:
 ### `tests/test_mcp/`
 Tests for all MCP tool functions and the MCPClient.
 
-`execute_code` tests run actual subprocess executions (no mock needed — tests the real sandbox).  
+`execute_code` tests run actual subprocess executions, so they exercise the
+real code path rather than a mock. They enable the tool explicitly through the
+`code_execution_enabled` fixture, because it is **off by default** and is not
+a sandbox — see [LIMITATIONS.md](LIMITATIONS.md). There is also a test
+asserting it stays off without that fixture: a security default that nothing
+checks is a security default one careless refactor away from flipping.
 `search_knowledge` mocks the RAG pipeline.
 
 ### `tests/test_safety/`

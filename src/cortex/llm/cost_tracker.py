@@ -9,7 +9,9 @@ calls happen across different async tasks or workers.
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable
 from datetime import datetime, timezone
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 from litellm import ModelResponse
@@ -42,7 +44,7 @@ class CostEntry:
         self.completion_tokens = completion_tokens
         self.recorded_at = datetime.now(UTC).isoformat()
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "model": self.model,
             "cost_usd": self.cost_usd,
@@ -58,8 +60,8 @@ class CostTracker:
 
     async def _get_redis(self) -> aioredis.Redis:
         if self._redis is None:
-            self._redis = await aioredis.from_url(
-                str(settings.redis_url).replace("/0", f"/{settings.redis_cache_db}"),
+            self._redis = aioredis.Redis.from_url(
+                settings.redis_url_for_db(settings.redis_cache_db),
                 encoding="utf-8",
                 decode_responses=True,
             )
@@ -92,14 +94,16 @@ class CostTracker:
         """Return total USD spent in this run so far."""
         redis = await self._get_redis()
         key = f"{_COST_KEY_PREFIX}{run_id}"
-        entries = await redis.lrange(key, 0, -1)
-        return sum(json.loads(e)["cost_usd"] for e in entries)
+        entries = await cast("Awaitable[list[str]]", redis.lrange(key, 0, -1))
+        total: float = sum(float(json.loads(e)["cost_usd"]) for e in entries)
+        return total
 
-    async def get_run_summary(self, run_id: str) -> dict:
+    async def get_run_summary(self, run_id: str) -> dict[str, Any]:
         """Return a full cost breakdown for this run."""
         redis = await self._get_redis()
         key = f"{_COST_KEY_PREFIX}{run_id}"
-        entries = [json.loads(e) for e in await redis.lrange(key, 0, -1)]
+        raw = await cast("Awaitable[list[str]]", redis.lrange(key, 0, -1))
+        entries = [json.loads(e) for e in raw]
         total_cost = sum(e["cost_usd"] for e in entries)
         total_prompt = sum(e["prompt_tokens"] for e in entries)
         total_completion = sum(e["completion_tokens"] for e in entries)
