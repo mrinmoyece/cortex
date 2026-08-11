@@ -2,43 +2,34 @@
 
 ## Supported versions
 
-Cortex is a single-branch project. Only `main` receives fixes; there are no
-maintained release branches and no backports.
+Cortex has no maintained release branches. Security fixes are made on `main`;
+older commits and forks are not supported.
 
 ## Reporting a vulnerability
 
-Report privately through GitHub's
-[security advisory form](https://github.com/mrinmoyece/cortex/security/advisories/new).
-Please do not open a public issue for anything exploitable.
+Report exploitable issues privately through the
+[GitHub security advisory form](https://github.com/mrinmoyece/cortex/security/advisories/new).
+Do not open a public issue. Include the affected entry point or file,
+preconditions, impact, and a proof of concept when available.
 
-Include what you have: the affected file or endpoint, the conditions needed
-to reach it, and the impact. A proof of concept helps but is not required.
-
-This is a personal open-source project, not a vendored product. There is no
-guaranteed response time and no bug bounty. Reports are read and acted on as
-time allows, and credit is given in the advisory unless you prefer otherwise.
+This is a personal open-source project with no guaranteed response time or bug
+bounty. Reports are handled as maintainer availability permits.
 
 ## Scope
 
-In scope: anything in `src/cortex`, the deployment manifests under `deploy/`
-and `docker-compose.yml`, and the CI workflows.
+Runtime code under [`src/cortex`](src/cortex), deployment artifacts under
+[`deploy`](deploy) and [`docker-compose.yml`](docker-compose.yml), CI, and
+repository automation are in scope.
 
-Out of scope, because they are known and documented rather than undiscovered
-— see [docs/LIMITATIONS.md](docs/LIMITATIONS.md):
+Known and explicitly documented limitations are not undisclosed
+vulnerabilities by themselves. Examples include disabled-by-default
+unsandboxed code execution, process-local state, unauthenticated standalone
+MCP network transports, and public metrics when no token or network control is
+configured. Their exact boundaries and expected controls are documented in
+the [threat model](docs/THREAT_MODEL.md) and
+[limitations](docs/LIMITATIONS.md). A bypass of a stated control remains in
+scope.
 
-* **`execute_code` is not a sandbox.** It runs a subprocess in the same
-  container as the API. It is disabled by default (`CODE_EXECUTION_ENABLED`)
-  and the docstring says exactly this. Enabling it and then executing code is
-  the documented behaviour, not a vulnerability.
-* **Run state and rate limiting are per-process.** Both are in-memory, so
-  they do not hold across replicas. This is stated in the limitations doc.
-* **Default configuration is a local development configuration.** An ephemeral
-  `SECRET_KEY`, `0.0.0.0` binds and an unauthenticated `/metrics` are defaults
-  for `docker compose up`, and each one has a setting to change it.
-
-## Handling of secrets
-
-No credentials are committed to this repository. `deploy/k8s/service.yaml`
-contains placeholder values (`REPLACE_WITH_...`) intended to be replaced by a
-real secret manager; it is not a working secret. `.env.example` documents
-variable names only.
+Do not commit credentials. [`.env.example`](.env.example) contains names and
+development placeholders only; production secrets must be supplied by the
+deployment environment.

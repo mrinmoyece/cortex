@@ -19,8 +19,8 @@ a form. Delete any section that does not apply.
 - [ ] `mypy src`
 - [ ] `pytest` (coverage gate is 80%)
 - [ ] `bandit -r src -ll`
-- [ ] `python scripts/audit.py --extra dev`
-- [ ] `python -m perf.benchmark --concurrency 6 --iterations 25` (only if the
+- [ ] `python3 scripts/audit.py --extra dev --fresh`
+- [ ] `python3 -m perf.benchmark --concurrency 6 --iterations 25` (only if the
       request path changed)
 
 ## Risk

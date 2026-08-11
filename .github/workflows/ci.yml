@@ -34,8 +34,11 @@ jobs:
 
       - name: Lint
         run: |
-          ruff check src tests perf
-          ruff format --check src tests perf
+          ruff check src tests perf scripts
+          ruff format --check src tests perf scripts
+
+      - name: Documentation links
+        run: python3 scripts/check_docs.py
 
       - name: Type check
         # No longer advisory. The 83 strict-mode errors this was hiding are
@@ -53,7 +56,7 @@ jobs:
         # SECRET_KEY is unset on a clean machine. This step fails if that
         # coupling ever returns.
         env: {}
-        run: python -c "import cortex.api.main, cortex.mcp.server, cortex.workers.celery_app"
+        run: python3 -c "import cortex.api.main, cortex.mcp.server, cortex.workers.celery_app"
 
   security:
     runs-on: ubuntu-latest
@@ -68,7 +71,7 @@ jobs:
         # else the runner happens to have installed and aborts outright on
         # editable installs it cannot resolve. No `|| true`: a real advisory
         # gets a dated, justified entry in audit-ignore.toml or it gets fixed.
-        run: python scripts/audit.py --extra dev
+        run: python3 scripts/audit.py --extra dev --fresh
       - name: Static security analysis
         run: bandit -r src -ll
 
@@ -83,4 +86,4 @@ jobs:
         # Exits non-zero on a breach. Budgets cover the request edge only -
         # agent runs are provider-bound and would make this flaky rather
         # than informative. See docs/PERFORMANCE.md for the reasoning.
-        run: python -m perf.benchmark --concurrency 6 --iterations 25
+        run: python3 -m perf.benchmark --concurrency 6 --iterations 25

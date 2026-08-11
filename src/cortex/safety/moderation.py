@@ -299,7 +299,7 @@ class Moderator:
 
     def __init__(self, classifier: Classifier | None = None) -> None:
         #: Any object with `async classify(text, direction) -> Verdict`.
-        #: Left unset, only the local layers run - and `docs/GUARDRAILS.md`
+        #: Left unset, only the local layers run - and `docs/ARCHITECTURE.md`
         #: says so rather than implying a classifier is present.
         self._classifier = classifier
 

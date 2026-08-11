@@ -1,222 +1,139 @@
-# Evaluation Framework
+# Evaluation
 
-Cortex treats quality as a first-class engineering concern. Evaluation runs automatically — not as a one-off experiment.
+This document defines the evaluation methodology that the repository actually
+implements. Cortex has evaluation harnesses and regression inputs; it does
+**not** contain a validated production benchmark, a checked-in score report,
+or a CI gate on live-model quality.
 
-## Philosophy
+## Questions the harnesses answer
 
-Most AI systems are evaluated manually and infrequently. Cortex is wired to run
-evaluation:
-- **Every 6 hours** (Celery beat schedule, when a worker and beat are running)
-- **On demand** (any developer can run locally)
+| Harness | Question | Implementation | Evidence |
+|---|---|---|---|
+| RAG evaluation | Is an answer grounded in and relevant to supplied contexts? | [`ragas_runner.py`](../src/cortex/eval/ragas_runner.py) | [`test_eval.py`](../tests/test_eval/test_eval.py) |
+| Agent evaluation | Did a run complete tasks, use tools correctly, plan efficiently, and terminate correctly? | [`agent_eval.py`](../src/cortex/eval/agent_eval.py) | [`test_agent_eval.py`](../tests/test_eval/test_agent_eval.py) |
 
-Results are stored as Prometheus time-series metrics, so quality regressions are
-visible in Grafana before users notice them.
+RAG evaluation uses Ragas when the optional dependency imports successfully.
+Otherwise it uses an LLM judge for supported dimensions. Agent evaluation uses
+deterministic run-structure metrics where possible and reserves model judging
+for task completion. The critic inside the agent graph is not independent
+evaluation evidence.
 
-> **Scope, honestly.** The evaluation *harness* is tested; the *scores* are
-> not a validated quality claim. Nobody has run this suite against a live
-> corpus and a real model, so the thresholds below are targets chosen up
-> front, not measurements. CI does not gate on them — it runs the unit tests
-> for the harness. Wiring the eval into a deployment gate is a deliberate
-> decision that needs a baseline first.
+## Regression dataset
 
-## Installing the evaluation extra
+[`tests/eval/regression_cases.json`](../tests/eval/regression_cases.json)
+contains the checked-in questions, answers, contexts, and optional ground
+truth. These are fixed inputs for exercising the evaluator; they are not
+outputs generated from a deployed Cortex instance.
 
-`ragas` and `deepeval` are **not** runtime dependencies. They are heavy, and
-they drag transitive packages with open advisories into the production
-closure for a code path that never runs in production:
+Add a case only after:
 
-```bash
-pip install -e ".[eval]"
-```
+1. recording the model, prompt/config revision, and source corpus used;
+2. manually checking the answer, contexts, and ground truth;
+3. removing sensitive or proprietary content;
+4. running the suite with the same environment recorded for the case; and
+5. reviewing whether the case covers a new failure mode rather than duplicating
+   an existing one.
 
-Without the extra, `RagasEvaluator` falls back to an LLM judge and logs
-`eval.ragas_not_available`. That is a supported mode, not a broken one.
+Dataset changes should be reviewed like test changes: a case that cannot fail
+does not protect quality.
 
-> `import ragas` currently fails even when installed, against the released
-> `langchain-community` — it imports `langchain_community.chat_models.vertexai`,
-> which no longer exists. The import is guarded, so the fallback engages
-> automatically rather than crashing the run. See [LIMITATIONS.md](LIMITATIONS.md).
+## Metrics and decision rules
 
-## Ragas Metrics
+### RAG axes
 
-Cortex uses [Ragas](https://docs.ragas.io) as its primary evaluation library,
-when it is installed and importable.
+- **Faithfulness:** support for answer claims in supplied context.
+- **Answer relevancy:** alignment between answer and question.
+- **Context precision:** proportion of retrieved context useful to the answer.
+- **Context recall:** ground-truth coverage when labels are available.
 
-| Metric | Definition | Target |
-|--------|-----------|--------|
-| **Faithfulness** | What fraction of the answer's claims are supported by retrieved context? Measures hallucination. | ≥ 0.85 |
-| **Answer Relevancy** | How well does the answer address the original question? | ≥ 0.80 |
-| **Context Precision** | Of the retrieved chunks, what fraction were actually relevant? | ≥ 0.75 |
-| **Context Recall** | Was all ground-truth information present in the retrieved context? (requires labelled data) | ≥ 0.70 |
-| **Composite** | Average of faithfulness, relevancy, precision | ≥ 0.78 |
+The implementation's threshold values are target policy, not observed
+baselines. They are defined with the result models in
+[`ragas_runner.py`](../src/cortex/eval/ragas_runner.py).
 
-## Regression Test Cases
+### Agent axes
 
-Test cases live in `tests/eval/regression_cases.json`. Format:
+- **Task completion:** required tasks produced usable results.
+- **Tool correctness:** tool calls and outcomes match the run record.
+- **Plan efficiency:** completed work relative to plan size; reported but not
+  used alone as a correctness gate.
+- **Termination:** the run reached an expected terminal state instead of
+  exhausting limits or hanging.
 
-```json
-[
-  {
-    "question": "What are the main benefits of using MCP for tool exposure?",
-    "answer": "MCP provides native LLM client compatibility...",
-    "contexts": [
-      "Model Context Protocol (MCP) is the protocol adopted by...",
-      "Cortex exposes all its capabilities as MCP tools..."
-    ],
-    "ground_truth": "MCP enables native LLM client compatibility..."
-  }
-]
-```
+The agent evaluator gates axes individually rather than hiding a collapsed
+dimension in an average. If the judge is unavailable, a neutral score marked
+as non-evidence is returned; it must not be quoted as a measurement.
 
-- `question` — the input
-- `answer` — the model's output to evaluate
-- `contexts` — the RAG chunks used to generate the answer
-- `ground_truth` — optional; required for context recall
+## Reproducing evaluation
 
-**Adding new test cases:**
-1. Run the system on a representative query
-2. Manually verify the answer is correct
-3. Add the question, answer, contexts, and ground truth to `regression_cases.json`
-4. Run the eval suite to confirm the new case passes
-
-## Running Evaluations
-
-### Local
+Install the optional evaluation dependencies:
 
 ```bash
-# Full regression suite
-python -c "
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev,eval]"
+```
+
+First validate the harness without network calls:
+
+```bash
+pytest tests/test_eval --no-cov
+```
+
+Run the checked-in RAG regression inputs:
+
+```bash
+python3 - <<'PY'
 import asyncio
 from cortex.eval.ragas_runner import run_regression_suite
+
 result = asyncio.run(run_regression_suite())
 print(result.to_dict())
-print('PASSED' if result.passes_threshold() else 'FAILED')
-"
-
-# Single sample
-from cortex.eval.ragas_runner import RagasEvaluator, EvalSample
-evaluator = RagasEvaluator()
-sample = EvalSample(
-    question="What is RRF?",
-    answer="Reciprocal Rank Fusion combines rankings from multiple retrievers...",
-    contexts=["RRF is a rank aggregation method..."]
-)
-result = asyncio.run(evaluator.evaluate([sample]))
+print("passed targets:", result.passes_threshold())
+PY
 ```
 
-### In CI
+Both the Ragas path and the fallback are model-backed and may make network
+calls, require provider credentials, and incur provider charges. A
+reproducible report must record:
 
-Add to your CI pipeline (GitHub Actions example):
+- commit SHA and dirty/clean state;
+- Python and installed package versions;
+- evaluator path used (Ragas, DeepEval, deterministic, or LLM fallback);
+- provider and model identifiers;
+- prompt/config revision and dataset hash;
+- sample count, per-axis values, errors, and missing dimensions; and
+- execution timestamp and operator.
 
-```yaml
-- name: Run eval regression
-  run: |
-    python -c "
-    import asyncio, sys
-    from cortex.eval.ragas_runner import run_regression_suite
-    result = asyncio.run(run_regression_suite())
-    print(result.to_dict())
-    sys.exit(0 if result.passes_threshold() else 1)
-    "
-  env:
-    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-    SECRET_KEY: ${{ secrets.CORTEX_SECRET_KEY }}
-```
+No such report is committed today, so this repository makes no current quality
+score claim.
 
-### Scheduled (Celery beat)
+## Scheduled execution
 
-The eval regression runs automatically every 6 hours. Check the results:
+[`workers/celery_app.py`](../src/cortex/workers/celery_app.py) registers an
+evaluation task and a six-hour Celery beat schedule. It runs only where both
+worker and beat processes are operating with required provider configuration.
+The Kubernetes beat workload is fixed at one replica to avoid duplicate
+schedules. Scheduling a harness is not a deployment gate and does not by
+itself retain an auditable report.
+
+Operators can invoke the registered task:
 
 ```bash
-# Check Celery task history
-celery -A cortex.workers.celery_app inspect registered
-
-# Force-run now
 celery -A cortex.workers.celery_app call cortex.workers.celery_app.run_eval_regression
-
-# View results in Grafana: Quality & Evaluation panel
 ```
 
-## Baseline Scores
+## Interpreting a regression
 
-Current baseline on `tests/eval/regression_cases.json` (5 cases):
+1. Confirm the same evaluator path, model, prompt/config, and dataset were used.
+2. Separate evaluator/provider outages from answer-quality changes.
+3. Inspect per-sample results; do not diagnose from a composite alone.
+4. For faithfulness or precision changes, compare retrieved chunks and active
+   retrieval filters before changing the generation prompt.
+5. For termination or tool-correctness changes, inspect graph state and tool
+   traces rather than RAG metrics.
+6. Record accepted baseline changes with rationale; do not silently lower a
+   threshold.
 
-| Metric | Baseline | Target |
-|--------|---------|--------|
-| Faithfulness | 0.87 | ≥ 0.85 |
-| Answer Relevancy | 0.84 | ≥ 0.80 |
-| Context Precision | 0.79 | ≥ 0.75 |
-| Composite | 0.83 | ≥ 0.78 |
-
-**These are aspirational baselines.** Your actual scores depend on your LLM, document corpus, and prompt versions. Establish your own baseline on first run, then protect it.
-
-## LLM-as-Judge Fallback
-
-When Ragas isn't available, Cortex falls back to LLM-as-judge scoring. The judge prompt asks GPT-4o to score faithfulness and relevancy for each sample.
-
-This is less reliable than Ragas (which uses dedicated models and multi-sample calibration) but better than nothing. The fallback is transparent — logs will show `eval.ragas_not_available`.
-
-## Interpreting Results
-
-**Faithfulness drops below 0.75:**
-- RAG quality issue — check that retrieved chunks contain the relevant information
-- Model is ignoring retrieved context — strengthen the system prompt's RAG instructions
-- Prompt drift — a recent prompt change caused hallucination; revert and re-test
-
-**Answer Relevancy drops below 0.70:**
-- System prompt is too restrictive and causing refusals
-- Planner is creating tasks that don't address the user's actual goal
-- Memory context is polluting the prompt with irrelevant past information
-
-**Context Precision drops below 0.60:**
-- Retrieval quality degraded — check embedding model and Qdrant index health
-- Chunk size too large — chunks contain too much irrelevant content
-- Consider tuning `RAG_BM25_WEIGHT` and `RAG_DENSE_WEIGHT`
-
-
-## Two harnesses, because they answer different questions
-
-| harness | scores | backend |
-|---|---|---|
-| `eval/ragas_runner.py` | retrieval and generation — faithfulness, answer relevancy, context precision | Ragas, falling back to an LLM judge |
-| `eval/agent_eval.py` | the agent loop — task completion, tool correctness, plan efficiency, termination | DeepEval, falling back to deterministic metrics |
-
-Ragas cannot see the part of Cortex that makes it an agent. It has no notion
-of a goal, tool calls are invisible to it, and it cannot tell a run that
-converged from one that was stopped by a budget ceiling.
-
-Before this, the only thing scoring the agent loop was the critic — which is
-*part of* the loop. A system grading its own homework produces a number
-that is stable, plausible and worthless.
-
-### The fallback is not a stub
-
-Three of the four agent axes need no model at all: tool correctness, plan
-efficiency and termination are computed from the run's own structure. Only
-task completion degrades to an LLM judge.
-
-That split is deliberate. DeepEval and Ragas are both heavy optional
-dependencies, and the environment least likely to have them installed is
-CI — which is exactly where the harness needs to still measure something.
-
-### Thresholds are per-axis, not on the average
-
-`passes()` checks completion, tool correctness and termination separately.
-An average lets one collapsed dimension hide behind three healthy ones, and
-"terminated correctly 40% of the time" is not something an overall 0.8
-should be able to conceal.
-
-`termination` carries the strictest threshold (0.90) because it is the
-failure users actually notice: a loop that exhausts its budget produces a
-bill and no answer.
-
-Plan efficiency is **reported but not gated**. An inefficient plan that
-reaches the right answer is a cost problem, not a correctness one — it
-belongs on a dashboard, not in a gate that blocks a release.
-
-### An unreachable judge scores 0.5
-
-Not 0.0 and not 1.0. Scoring an outage as a failure makes it look like a
-quality regression; scoring it as a pass lets an outage hide one. The score
-carries `"not evidence"` in its detail string so a report cannot quote it
-as a measurement.
+Prometheus quality series and alert thresholds are described in
+[Operations](OPERATIONS.md#service-indicators-and-objectives). They are
+operational signals, not substitutes for a versioned evaluation report.

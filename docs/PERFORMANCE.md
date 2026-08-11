@@ -1,9 +1,13 @@
 # Performance
 
-Regenerate with `python -m perf.benchmark --write`. Enforced in CI by
+Regenerate with `python3 -m perf.benchmark --write`. Enforced in CI by
 `make perf`, which exits non-zero on a breached budget.
 
 ## Measured
+
+Generated at `2026-08-11T23:49:21Z` on `Darwin 25.5.0 (arm64)` with Python `3.13.2`.
+Measured source: `cc1a83259103 (dirty working tree)`. A dirty result includes uncommitted code and is
+not attributable to the named commit alone.
 
 5 independent rounds, each 6 concurrent clients running
 25 iterations, ASGI in-process. Latencies in milliseconds.
@@ -12,22 +16,22 @@ are pooled over all of them.
 
 | path | samples | p50 | p95 | p99 | max | budget p95/p99 |
 |---|---|---|---|---|---|---|
-| `health` | 750 | 1.54 | 1.68 | 1.80 | 2.02 | 15 / 40 |
-| `metrics` | 750 | 5.42 | 6.21 | 6.26 | 6.71 | 40 / 90 |
-| `unauthorised` | 750 | 3.17 | 3.44 | 3.53 | 4.27 | 20 / 50 |
-| `invalid_body` | 750 | 3.53 | 3.89 | 4.09 | 4.54 | 25 / 60 |
-| `rate_limited` | 750 | 0.89 | 1.12 | 1.20 | 1.31 | 20 / 50 |
+| `health` | 750 | 1.94 | 2.37 | 2.46 | 2.73 | 15 / 40 |
+| `metrics` | 750 | 6.29 | 7.05 | 7.41 | 8.02 | 40 / 90 |
+| `unauthorised` | 750 | 4.17 | 4.64 | 4.85 | 5.10 | 20 / 50 |
+| `invalid_body` | 750 | 4.57 | 5.20 | 5.39 | 5.84 | 25 / 60 |
+| `rate_limited` | 750 | 1.10 | 1.51 | 1.63 | 1.81 | 20 / 50 |
 
 Per-round p99, so the agreement between rounds is visible rather than
 smoothed away by the median:
 
 | path | p99 per round |
 |---|---|
-| `health` | 1.80, 1.62, 2.01, 1.87, 1.72 |
-| `metrics` | 6.70, 6.19, 6.36, 6.23, 6.26 |
-| `unauthorised` | 3.36, 3.51, 4.26, 3.58, 3.53 |
-| `invalid_body` | 4.05, 3.94, 4.09, 4.46, 4.20 |
-| `rate_limited` | 1.20, 1.15, 1.25, 1.18, 1.20 |
+| `health` | 2.59, 2.46, 2.31, 2.72, 2.43 |
+| `metrics` | 8.00, 7.41, 7.07, 7.44, 7.38 |
+| `unauthorised` | 4.99, 5.09, 4.56, 4.70, 4.85 |
+| `invalid_body` | 5.39, 5.72, 5.33, 5.51, 5.25 |
+| `rate_limited` | 1.68, 1.67, 1.63, 1.57, 1.56 |
 
 ## How it is measured, and why the harness is this careful
 
