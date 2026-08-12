@@ -211,6 +211,43 @@ class TestExecutorNode:
 
         assert out["total_cost_usd"] == pytest.approx(0.40)
 
+    @pytest.mark.asyncio
+    async def test_a_negative_delta_cannot_walk_the_run_total_backwards(self):
+        """`ExecutorAgent` derives `cost_delta` from two ledger reads taken
+        either side of the task, so losing the key between them yields a
+        *negative* delta. `max()` alone does not save us here: the same
+        eviction depresses the ledger total, so both inputs are low and the
+        run total would drop below what it had already recorded."""
+        t = _task("a")
+        state = _state(tasks=[t], total_cost_usd=1.90)
+        with patch("cortex.graph.cortex_graph.ExecutorAgent") as agent_cls:
+            agent = agent_cls.return_value
+            agent.execute_task = AsyncMock(
+                return_value=(t.mark_started().mark_completed("ok"), -1.75)
+            )
+            agent.compile_output = AsyncMock(return_value="final")
+            agent.get_run_cost = AsyncMock(return_value=0.02)  # evicted mid-task
+            out = await executor_node(state)
+
+        assert out["total_cost_usd"] == pytest.approx(1.90), "spend is not refundable"
+
+    @pytest.mark.asyncio
+    async def test_the_budget_guard_survives_an_eviction_mid_task(self):
+        """The consequence of the above, asserted through the guard itself."""
+        t = _task("a")
+        state = _state(tasks=[t], total_cost_usd=settings.max_cost_per_run_usd)
+        with patch("cortex.graph.cortex_graph.ExecutorAgent") as agent_cls:
+            agent = agent_cls.return_value
+            agent.execute_task = AsyncMock(
+                return_value=(t.mark_started().mark_completed("ok"), -settings.max_cost_per_run_usd)
+            )
+            agent.compile_output = AsyncMock(return_value="final")
+            agent.get_run_cost = AsyncMock(return_value=0.0)
+            out = await executor_node(state)
+
+        spent = state.model_copy(update={**out, "status": RunStatus.EXECUTING})
+        assert route_after_executor(spent) == "end_failed"
+
 
 class TestSaveMemoryNode:
     @pytest.mark.asyncio

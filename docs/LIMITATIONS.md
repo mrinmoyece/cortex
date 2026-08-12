@@ -34,9 +34,32 @@ inside the same process.
 The graph-level guard ends execution when state cost or iteration count reaches
 its ceiling, but does not first change an `executing` state to `failed`.
 Polling/SSE can therefore observe a nonterminal status after graph execution.
-The LLM router separately checks the Redis ledger before provider calls and
-remains the effective spend ceiling. The graph exit needs an explicit failure
-node and regression test.
+The LLM router separately checks the Redis ledger before provider calls, but
+that check degrades when the ledger is missing (see below). The graph exit
+needs an explicit failure node and regression test.
+
+### The cost ledger is not durable
+
+`CostTracker` writes per-run spend to the Redis **cache** database, and the
+shipped [`docker-compose.yml`](../docker-compose.yml) runs that instance with
+`--maxmemory-policy allkeys-lru`. Cost keys are evictable under the memory
+pressure the semantic cache itself produces, and they carry a one-hour TTL
+refreshed on each write, which expires a run idle for that long. A missing key
+reads as `$0.00` rather than raising, so neither loss is distinguishable from a
+run that has spent nothing.
+
+The two budget gates degrade differently:
+
+- The graph's `total_cost_usd` is the larger of the ledger figure and its own
+  accumulated total, so a lost ledger cannot lower it and `route_after_executor`
+  remains enforceable.
+- The router's per-call check in `complete()` has no such floor. If the key is
+  gone it reads `$0.00` and the run's remaining budget is effectively restored
+  for subsequent provider calls. This is tracked in
+  [issue #12](https://github.com/mrinmoyece/cortex/issues/12).
+
+Reconcile spend against provider billing. Redis cost data is an operational
+signal, not accounting.
 
 ### Standalone MCP network transports are unauthenticated
 
@@ -127,6 +150,8 @@ illustrative rather than active safety controls.
 4. Replace or synchronize the in-process sparse index and add ingestion
    reconciliation.
 5. Exercise the Kubernetes topology under failure, rollout, and restore tests.
+6. Give per-run cost accounting a durable store so both budget gates fail
+   closed rather than reading an evicted key as zero spend.
 
 ### Security and governance
 
