@@ -109,19 +109,45 @@ async def planner_node(state: CortexState) -> dict[str, Any]:
 async def _run_total_cost(agent: Any, state: CortexState, cost_delta: float) -> float:
     """Best available figure for what this run has cost so far.
 
-    The router's ledger is authoritative: the executor can make an extra LLM
-    call after the task itself (output compilation), so the per-task delta
-    alone under-reports. But the ledger lives in Redis, and a lookup failure
-    there must not be able to reach the caller — it is raised from the same
-    `try` that guards task execution, so an unhandled failure would mark a
-    task that actually succeeded as failed and throw its result away.
-    Accounting degrades to the locally accumulated total instead.
+    Two sources, and neither is sufficient alone.
+
+    The router's Redis ledger sees spend the graph does not: the executor
+    makes an extra LLM call after the task itself (output compilation), and
+    MCP tools bill their own completions to this run id. But that ledger
+    carries a one-hour TTL and is evictable, and an expired key reads as
+    `0.0` rather than raising — so trusting it outright lets a long run's
+    reported cost fall back to zero.
+
+    The locally accumulated total misses the spend above, but it only ever
+    grows. Taking the larger keeps both properties: the ledger's coverage,
+    and monotonicity. That matters beyond reporting, because
+    `route_after_executor` ends a run once `total_cost_usd` reaches
+    `MAX_COST_PER_RUN_USD` — a total that can reset is a budget guard that
+    can be outlived.
+
+    A ledger lookup that *fails* degrades to the accumulator alone. It is
+    raised from the same `try` that guards task execution, so an unhandled
+    failure would mark a task that actually succeeded as failed and throw
+    its result away.
     """
+    accumulated = state.total_cost_usd + cost_delta
     try:
-        return float(await agent.get_run_cost(state.run_id))
+        ledger_total = float(await agent.get_run_cost(state.run_id))
     except Exception as exc:  # accounting must not be able to fail a run
         logger.warning("executor.cost_ledger_unavailable", run_id=state.run_id, error=str(exc))
-        return state.total_cost_usd + cost_delta
+        return accumulated
+
+    if ledger_total < accumulated:
+        # Expected once past the ledger TTL on a long run; also what an
+        # eviction looks like. Worth a line, because the gap is spend the
+        # ledger can no longer account for.
+        logger.warning(
+            "executor.cost_ledger_below_accumulated",
+            run_id=state.run_id,
+            ledger_usd=f"{ledger_total:.6f}",
+            accumulated_usd=f"{accumulated:.6f}",
+        )
+    return max(ledger_total, accumulated)
 
 
 async def executor_node(state: CortexState) -> dict[str, Any]:
@@ -156,8 +182,9 @@ async def executor_node(state: CortexState) -> dict[str, Any]:
         return {
             "tasks": updated_tasks,
             "final_output": output,
-            # The compiler can make an additional LLM call after the task,
-            # so the ledger total is preferred over the task delta alone.
+            # Compilation and MCP tools spend against this run beyond the
+            # task delta, but the ledger they record to can expire. See
+            # `_run_total_cost`.
             "total_cost_usd": await _run_total_cost(agent, state, cost_delta),
             "status": RunStatus.CRITIQUING if all_done else RunStatus.EXECUTING,
         }
