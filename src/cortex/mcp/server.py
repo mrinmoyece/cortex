@@ -31,6 +31,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -183,6 +184,43 @@ def current_principal() -> Principal:
             "single-user stdio server only - set MCP_PRINCIPAL_USER_ID."
         )
     return principal
+
+
+# ── Cost attribution ─────────────────────────────────────────────────────────
+#
+# Two tools (`query_data`, `synthesise`) make their own LLM calls, and the
+# router meters spend per `run_id`. Both minted a fresh UUID per call, so a
+# tool invoked from an agent run billed itself to a run id nothing else knew
+# about: the run's budget gate never saw that spend (a run could exceed
+# `MAX_COST_PER_RUN_USD` by calling tools) and `total_cost_usd` reported back
+# to the user under-counted it.
+#
+# Like the principal, the run id is bound out of band rather than accepted as
+# a tool argument — it is a billing identity, and the model must not be able
+# to choose which ledger its calls land on.
+
+_run_id: ContextVar[str | None] = ContextVar("cortex_mcp_run_id", default=None)
+
+
+@contextlib.contextmanager
+def use_run_id(run_id: str) -> Iterator[None]:
+    """Bind the cost-ledger run id for the duration of a tool call."""
+    token = _run_id.set(run_id)
+    try:
+        yield
+    finally:
+        _run_id.reset(token)
+
+
+def current_run_id() -> str:
+    """Return the run id LLM calls made inside a tool should bill to.
+
+    Falls back to a fresh id when nothing is bound. That is the standalone
+    case — a desktop MCP client, or `POST /api/v1/mcp/call` — where there is
+    no enclosing run, and where a shared constant would make unrelated
+    callers consume each other's budget.
+    """
+    return _run_id.get() or str(uuid.uuid4())
 
 
 # Lazily initialised singletons (avoid slow startup on import)
@@ -487,7 +525,7 @@ async def _to_sql(question: str, schema: str) -> str:
             },
             {"role": "user", "content": question},
         ],
-        run_id="mcp-query-data",
+        run_id=current_run_id(),
         temperature=0.0,
     )
     sql = (response.choices[0].message.content or "").strip()
@@ -516,8 +554,10 @@ async def synthesise(
 
     router = get_router()
 
-    # Use a stub run_id for MCP tool calls
-    run_id = "mcp-synthesise"
+    # Bills to the enclosing agent run when there is one, so the run's budget
+    # gate and reported total include this call. Standalone callers get a
+    # fresh ledger of their own — see `current_run_id`.
+    run_id = current_run_id()
     messages = [
         {
             "role": "system",

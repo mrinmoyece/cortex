@@ -8,16 +8,15 @@ metadata:
     component: api
     version: "1.0.0"
 spec:
-  replicas: 2
+  # Run tracking is process-local. Until it moves to shared storage, one
+  # replica/worker is required so polling and SSE reach the creating process.
+  replicas: 1
   selector:
     matchLabels:
       app: cortex
       component: api
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0          # Zero-downtime rolling update
+    type: Recreate
   template:
     metadata:
       labels:
@@ -163,6 +162,8 @@ metadata:
   namespace: cortex
 spec:
   replicas: 1               # Always exactly 1 — multiple beat schedulers cause duplicate tasks
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: cortex

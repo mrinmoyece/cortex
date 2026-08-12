@@ -45,6 +45,7 @@ def agent():
     with patch("cortex.agents.executor.get_router"), patch("cortex.agents.executor.get_mcp_client"):
         a = ExecutorAgent()
     a._router = AsyncMock()
+    a._router.get_run_cost = AsyncMock(return_value=0.0)
     a._mcp = AsyncMock()
     a._mcp.get_tool_schemas = AsyncMock(return_value=[])
     return a
@@ -57,6 +58,15 @@ class TestExecuteTask:
         task, _cost = await agent.execute_task(_task(), _state())
         assert task.status == TaskStatus.COMPLETED
         assert task.result == "the answer"
+
+    @pytest.mark.asyncio
+    async def test_cost_delta_comes_from_the_router_ledger(self, agent):
+        agent._router.get_run_cost = AsyncMock(side_effect=[0.1, 0.4])
+        agent._router.complete = AsyncMock(return_value=_msg(content="the answer"))
+
+        _, cost = await agent.execute_task(_task(), _state(total_cost_usd=0.0))
+
+        assert cost == pytest.approx(0.3)
 
     @pytest.mark.asyncio
     async def test_the_failure_sentinel_marks_the_task_failed(self, agent):

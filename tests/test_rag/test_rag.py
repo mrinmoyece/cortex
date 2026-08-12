@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Callable
+from typing import ClassVar
+from unittest.mock import patch
+
+from rank_bm25 import BM25Okapi
+
+from cortex.rag import pipeline
 from cortex.rag.pipeline import (
     Document,
     RAGPipeline,
@@ -170,6 +178,9 @@ class TestDocumentIdIsAcceptableToQdrant:
         assert Document("same").id == Document("same").id
         assert Document("same").id != Document("other").id
 
+    def test_identical_content_from_distinct_sources_has_distinct_ids(self):
+        assert Document("same", {"source": "one"}).id != Document("same", {"source": "two"}).id
+
 
 class TestSparseRetrievalHonoursFilters:
     """Dense search enforced `filters`; sparse did not. A filtered hybrid
@@ -219,6 +230,66 @@ class TestSparseRetrievalHonoursFilters:
         )
         assert retriever.search("alpha", top_k=5, filters={"tenant": "acme", "src": "wiki"})
         assert not retriever.search("alpha", top_k=5, filters={"tenant": "acme", "src": "pdf"})
+
+
+class TestSparseIndexIsSafeToReadWhileItIsRewritten:
+    """`RAGPipeline.retrieve` runs `search()` in a worker thread while
+    `index()` runs on the event loop. When corpus and index were two separate
+    attributes, a reader could take the index from one generation and the
+    corpus from another: BM25 positions then point into the wrong list, which
+    raises IndexError or silently returns a document that did not score."""
+
+    def test_a_reindex_midway_through_a_search_cannot_tear_the_snapshot(self):
+        retriever = SparseRetriever()
+
+        # Simulates the interleaving precisely: an ingestion completes while
+        # a search is between "score the corpus" and "read the corpus".
+        class _ReindexingBM25(BM25Okapi):
+            hook: ClassVar[Callable[[], None] | None] = None
+
+            def get_scores(self, tokens):
+                hook, _ReindexingBM25.hook = _ReindexingBM25.hook, None
+                if hook is not None:
+                    hook()
+                return super().get_scores(tokens)
+
+        with patch.object(pipeline, "BM25Okapi", _ReindexingBM25):
+            retriever.index([Document(f"alpha document number {i}") for i in range(20)])
+            _ReindexingBM25.hook = lambda: retriever.index([Document("beta")])
+            hits = retriever.search("alpha document", top_k=5)
+
+        assert hits, "the search that started before the reindex still had a corpus"
+        assert all("alpha" in h.content for h in hits)
+
+    def test_concurrent_searches_and_reindexes_do_not_raise(self):
+        retriever = SparseRetriever()
+        big = [Document(f"alpha document number {i}") for i in range(50)]
+        small = [Document("alpha")]
+        retriever.index(big)
+
+        errors: list[BaseException] = []
+        stop = threading.Event()
+
+        def search_loop():
+            try:
+                while not stop.is_set():
+                    for hit in retriever.search("alpha document", top_k=5):
+                        assert hit.content.startswith("alpha")
+            except BaseException as exc:  # reported to the main thread below
+                errors.append(exc)
+
+        readers = [threading.Thread(target=search_loop) for _ in range(4)]
+        for reader in readers:
+            reader.start()
+        try:
+            for i in range(200):
+                retriever.index(big if i % 2 else small)
+        finally:
+            stop.set()
+            for reader in readers:
+                reader.join(timeout=10)
+
+        assert not errors, f"concurrent search raised: {errors[0]!r}"
 
 
 class TestPayloadFilterHelpers:

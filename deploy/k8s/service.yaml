@@ -65,7 +65,7 @@ data:
   LOG_LEVEL: "INFO"
   API_HOST: "0.0.0.0"
   API_PORT: "8000"
-  API_WORKERS: "4"
+  API_WORKERS: "1"
   QDRANT_URL: "http://qdrant:6333"
   REDIS_URL: "redis://redis:6379/0"
   OTEL_EXPORTER_ENDPOINT: "http://phoenix:4317"
@@ -87,11 +87,9 @@ metadata:
   name: cortex-secrets
   namespace: cortex
 type: Opaque
-stringData:
-  SECRET_KEY: "REPLACE_WITH_RANDOM_32_CHAR_STRING"
-  OPENAI_API_KEY: "REPLACE_WITH_KEY"
-  ANTHROPIC_API_KEY: "REPLACE_WITH_KEY"
-  COHERE_API_KEY: "REPLACE_WITH_KEY"
+# Create this Secret from a managed secret store before applying the
+# workloads; no predictable JWT signing key is supplied by this manifest.
+stringData: {}
   # METRICS_TOKEN is deliberately NOT set here.
   #
   # These manifests scrape with the `prometheus.io/scrape` pod annotations,
@@ -143,8 +141,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: cortex-api
-  minReplicas: 2
-  maxReplicas: 10
+  minReplicas: 1
+  maxReplicas: 1
   metrics:
     - type: Resource
       resource:

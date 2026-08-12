@@ -11,7 +11,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from cortex.graph.cortex_graph import executor_node, load_memory_node, save_memory_node
+from cortex.config import settings
+from cortex.graph.cortex_graph import (
+    executor_node,
+    load_memory_node,
+    route_after_executor,
+    save_memory_node,
+)
 from cortex.graph.state import CortexState, RunStatus, Task, TaskStatus
 
 
@@ -107,6 +113,103 @@ class TestExecutorNode:
         assert "status" not in out or out.get("status") != RunStatus.FAILED
         assert out["tasks"][0].status == TaskStatus.FAILED
         assert "boom" in out["tasks"][0].error
+
+    @pytest.mark.asyncio
+    async def test_the_ledger_total_is_preferred_when_it_is_available(self):
+        """Compilation makes an extra LLM call after the task, so the
+        per-task delta alone under-reports what the run actually spent."""
+        t = _task("a")
+        state = _state(tasks=[t], total_cost_usd=0.10)
+        with patch("cortex.graph.cortex_graph.ExecutorAgent") as agent_cls:
+            agent = agent_cls.return_value
+            agent.execute_task = AsyncMock(
+                return_value=(t.mark_started().mark_completed("ok"), 0.05)
+            )
+            agent.compile_output = AsyncMock(return_value="final")
+            agent.get_run_cost = AsyncMock(return_value=0.22)
+            out = await executor_node(state)
+
+        assert out["total_cost_usd"] == pytest.approx(0.22)
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_cost_ledger_does_not_discard_a_finished_task(self):
+        """The ledger lookup shares a `try` with task execution. If Redis is
+        down, an accounting failure must not be able to mark a task that
+        succeeded as failed and throw its result away."""
+        t = _task("a")
+        state = _state(tasks=[t], total_cost_usd=0.10)
+        with patch("cortex.graph.cortex_graph.ExecutorAgent") as agent_cls:
+            agent = agent_cls.return_value
+            agent.execute_task = AsyncMock(
+                return_value=(t.mark_started().mark_completed("ok"), 0.05)
+            )
+            agent.compile_output = AsyncMock(return_value="final")
+            agent.get_run_cost = AsyncMock(side_effect=ConnectionError("redis down"))
+            out = await executor_node(state)
+
+        assert out["tasks"][0].status == TaskStatus.COMPLETED
+        assert out["tasks"][0].result == "ok"
+        assert out["final_output"] == "final"
+        assert out["status"] == RunStatus.CRITIQUING
+        assert out["total_cost_usd"] == pytest.approx(0.15), "degrades to the accumulated total"
+
+    @pytest.mark.asyncio
+    async def test_a_lost_cost_ledger_cannot_reset_the_run_total(self):
+        """The ledger is not durable: it lives in the cache database, which
+        ships under `allkeys-lru`, so a cost key is evictable at any time
+        under memory pressure. A missing key reads as 0.0 rather than
+        raising, so trusting it outright lets a run's reported cost fall back
+        to zero - and `route_after_executor` ends a run on exactly this
+        value, so a total that can reset is a budget guard that can be
+        outlived."""
+        t = _task("a")
+        state = _state(tasks=[t], total_cost_usd=1.80)
+        with patch("cortex.graph.cortex_graph.ExecutorAgent") as agent_cls:
+            agent = agent_cls.return_value
+            agent.execute_task = AsyncMock(
+                return_value=(t.mark_started().mark_completed("ok"), 0.05)
+            )
+            agent.compile_output = AsyncMock(return_value="final")
+            agent.get_run_cost = AsyncMock(return_value=0.0)  # evicted / expired
+            out = await executor_node(state)
+
+        assert out["total_cost_usd"] == pytest.approx(1.85)
+
+    @pytest.mark.asyncio
+    async def test_the_budget_guard_still_fires_after_the_ledger_is_lost(self):
+        """The guard is the reason monotonicity matters. Driven through the
+        real router so this fails if the accounting regresses."""
+        t = _task("a")
+        state = _state(tasks=[t], total_cost_usd=settings.max_cost_per_run_usd - 0.01)
+        with patch("cortex.graph.cortex_graph.ExecutorAgent") as agent_cls:
+            agent = agent_cls.return_value
+            agent.execute_task = AsyncMock(
+                return_value=(t.mark_started().mark_completed("ok"), 0.05)
+            )
+            agent.compile_output = AsyncMock(return_value="final")
+            agent.get_run_cost = AsyncMock(return_value=0.0)  # evicted / expired
+            out = await executor_node(state)
+
+        spent = state.model_copy(update={**out, "status": RunStatus.EXECUTING})
+        assert spent.total_cost_usd >= settings.max_cost_per_run_usd
+        assert route_after_executor(spent) == "end_failed"
+
+    @pytest.mark.asyncio
+    async def test_the_ledger_still_wins_when_it_exceeds_the_local_total(self):
+        """Monotonicity must not cost the ledger's coverage: compilation and
+        MCP tool calls bill spend the per-task delta never sees."""
+        t = _task("a")
+        state = _state(tasks=[t], total_cost_usd=0.10)
+        with patch("cortex.graph.cortex_graph.ExecutorAgent") as agent_cls:
+            agent = agent_cls.return_value
+            agent.execute_task = AsyncMock(
+                return_value=(t.mark_started().mark_completed("ok"), 0.05)
+            )
+            agent.compile_output = AsyncMock(return_value="final")
+            agent.get_run_cost = AsyncMock(return_value=0.40)
+            out = await executor_node(state)
+
+        assert out["total_cost_usd"] == pytest.approx(0.40)
 
 
 class TestSaveMemoryNode:

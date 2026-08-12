@@ -1,83 +1,104 @@
 # Contributing to Cortex
 
-The README linked to this file for some time before it existed. That is the
-kind of small dishonesty this document is about.
-
-## Getting a working checkout
+## Development setup
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                      # 233 tests, no services required
 ```
 
-The suite is **hermetic**. It needs no Redis, no Qdrant, no API key, and no
-environment variables. If a change makes a test require infrastructure, the
-change is wrong, not the test — see [Hermetic tests](#hermetic-tests) below.
+Python support and all dependency groups are defined in
+[`pyproject.toml`](pyproject.toml). The default tests are hermetic: use
+`fakeredis` or injected doubles for stores, patch provider clients, and do not
+require developer credentials or running services.
 
-## The bar for a change
+## Required gates
 
-**Every behavioural claim needs a test that would fail without it.** Not a
-test that passes either way. Before opening a PR, break your own fix and
-confirm the test goes red; if it stays green, the test is decoration.
+Run the same aggregate gate exposed by the repository:
 
-**The coverage gate is 80% and it is enforced** (`--cov-fail-under=80` in
-`pyproject.toml`). Do not lower it to make a branch pass. Coverage is a
-floor, not a target — 100% coverage of code that asserts nothing is worth
-less than 60% of code that asserts precisely.
-
-**Comments explain *why*, never *what*.** `# increment the counter` above
-`counter += 1` is noise. `# Checked before the call, not after, because the
-spend that breaches the limit must never happen` is the reason someone will
-need in six months.
-
-## Hermetic tests
-
-A test that needs a live service is a test that does not run — and a suite
-that does not run is how this project ended up with 77 files, an 80%
-coverage gate and zero executions.
-
-- External stores: use `fakeredis`, or inject a double.
-- LLM calls: patch the **router singleton** (`cortex.llm.router._router`),
-  not the `get_router` name. Agents bind `get_router` at import time, so
-  patching the source module rebinds a name nobody reads — a mistake that
-  silently sent four tests at a real Redis.
-- Anything with a clock: inject the time, or assert a bound rather than a
-  value.
-
-## Security-sensitive areas
-
-Changes to these need a test demonstrating the attack is still blocked:
-
-| Area | The property |
-|---|---|
-| `mcp/server.py` `execute_code` | The block list is an allowlist of safe constructs, not a denylist of scary words |
-| `mcp/server.py` `query_data` | A single bare `SELECT`, executed on a read-only connection |
-| `safety/middleware.py` | Injection patterns and PII redaction |
-| `api/ratelimit.py` | Limiting happens before routing, so 404s and 422s are metered too |
-| `llm/router.py` | The budget gate runs *before* the call it authorises |
-
-## Commit messages
-
-Subject line in the imperative, under ~70 characters. If the change fixes a
-defect, the body should say what the defect was and how it was found — those
-messages are the most useful documentation in the repository.
-
-```
-fix: bind tools to the model before invoking it
-
-`bind_tools()` was defined and never called, so no model was ever told
-which tools existed. Invisible under a scripted model whose tool calls
-are authored into the fixture; fatal against a real provider.
+```bash
+make gate
 ```
 
-## What gets rejected
+Its commands are defined in the [`Makefile`](Makefile):
 
-- A test that would pass against the unfixed code.
-- A dependency added to `pyproject.toml` and not imported. Unused
-  dependencies inflate the image and the CVE surface, and mislead a reader
-  about the architecture — several were removed for exactly this reason.
-- A setting that nothing reads. `api_rate_limit_per_minute` was configured,
-  documented and unenforced for the project's whole life; a control an
-  operator believes they have is worse than one they know they lack.
-- A claim in a doc that the code does not support.
+| Gate | Command | Purpose |
+|---|---|---|
+| Documentation | `make docs` | Relative link and anchor integrity |
+| Lint/format | `make lint` | Ruff checks for source, tests, performance code, and scripts |
+| Types | `make types` | Strict mypy checks for `src` |
+| Tests | `make test` | Pytest with the 80% coverage floor from `pyproject.toml` |
+| Static security | `make security` | Bandit over `src` |
+| Dependency audit | `make audit-fresh` | Project-scoped dependency closure resolved from the index |
+| Edge performance | `make perf` | Deterministic ASGI edge budgets |
+
+CI runs Python 3.10 and 3.13 for quality checks, plus independent security and
+performance jobs; the workflow is
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+`make audit` is useful for inspecting the versions already installed in a
+development environment. The aggregate gate uses `make audit-fresh` so stale
+unrelated state in a long-lived environment does not determine whether the
+repository's current dependency constraints pass.
+
+Use targeted commands while iterating:
+
+```bash
+pytest tests/test_api tests/test_graph --no-cov
+pytest tests/test_agents/test_agents.py -k planner --no-cov
+ruff check src tests perf scripts
+mypy src
+python3 scripts/check_docs.py
+```
+
+## Test strategy
+
+- Unit tests isolate agents, routing, safety, retrieval, and storage behavior.
+- API tests exercise FastAPI with real JWTs and mocked external work.
+- Graph tests execute state transitions with a mocked LLM router.
+- Deployment tests parse Compose/Kubernetes configuration and assert manifest
+  consistency.
+- Evaluation harness tests validate scoring and fallback behavior; the JSON
+  cases under [`tests/eval`](tests/eval) are evaluation inputs, not live-model
+  pytest cases.
+- Performance gate tests validate the benchmark itself before CI trusts its
+  result.
+
+The test tree is the executable index:
+[`tests/test_api`](tests/test_api),
+[`tests/test_agents`](tests/test_agents),
+[`tests/test_graph`](tests/test_graph),
+[`tests/test_mcp`](tests/test_mcp),
+[`tests/test_rag`](tests/test_rag),
+[`tests/test_memory`](tests/test_memory),
+[`tests/test_safety`](tests/test_safety),
+[`tests/test_eval`](tests/test_eval),
+[`tests/test_obs`](tests/test_obs),
+[`tests/test_perf`](tests/test_perf), and
+[`tests/test_deploy`](tests/test_deploy).
+
+## Change requirements
+
+- Add a test that fails without the behavior being introduced or fixed.
+- Update the canonical document from the
+  [documentation map](README.md#documentation-map-and-ownership) when behavior,
+  configuration, operations, or limitations change.
+- Add or supersede an ADR when changing a major architectural decision.
+- Keep external calls mocked in the default suite.
+- Do not add a setting, dependency, dashboard, alert, or security control that
+  no runtime path reads.
+- Do not report generated or aspirational evaluation numbers as measured
+  evidence.
+
+Security-sensitive changes to authentication, principal binding, tenant
+filters, code execution, rate limiting, safety checks, or budget enforcement
+need attack-oriented regression tests. Review the
+[threat model](docs/THREAT_MODEL.md) before making those changes.
+
+## Commit and pull request conventions
+
+Use an imperative subject under roughly 70 characters. Explain the defect or
+decision in the body when the subject is not enough. Complete the repository's
+[pull request template](.github/PULL_REQUEST_TEMPLATE.md), listing only gates
+actually run and any unverified operational behavior.

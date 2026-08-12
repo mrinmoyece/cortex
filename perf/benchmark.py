@@ -1,7 +1,7 @@
 """Latency benchmark and performance gate for the Cortex API edge.
 
-    python -m perf.benchmark              # measure, print, enforce budgets
-    python -m perf.benchmark --write      # ...and regenerate docs/PERFORMANCE.md
+    python3 -m perf.benchmark              # measure, print, enforce budgets
+    python3 -m perf.benchmark --write      # ...and regenerate docs/PERFORMANCE.md
 
 Exit code 1 on a breached budget, so CI gates on it like a test.
 
@@ -98,11 +98,15 @@ import io
 import json
 import logging
 import os
+import platform
+import shutil
 import statistics
+import subprocess
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -182,6 +186,7 @@ def _rejecting_app() -> Starlette:
 
 
 DOC = Path(__file__).resolve().parents[1] / "docs" / "PERFORMANCE.md"
+ROOT = DOC.parents[1]
 
 #: Independent measurement rounds. Odd, so the median is an observation
 #: rather than a midpoint between two. Five gives a breakdown point of two
@@ -484,6 +489,33 @@ def check(results: dict[str, Aggregate] | dict[str, Measurement]) -> list[str]:
     return breaches
 
 
+def source_revision() -> str:
+    """Return the measured Git revision and whether uncommitted code was present."""
+    git = shutil.which("git")
+    if git is None:
+        return "unknown (Git executable unavailable)"
+
+    revision = subprocess.run(  # noqa: S603
+        [git, "rev-parse", "--short=12", "HEAD"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if revision.returncode != 0:
+        return "unknown (Git revision unavailable)"
+
+    status = subprocess.run(  # noqa: S603
+        [git, "status", "--porcelain"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    state = "dirty working tree" if status.returncode != 0 or status.stdout else "clean"
+    return f"{revision.stdout.strip()} ({state})"
+
+
 def render(result: Run) -> str:
     rows = "\n".join(
         f"| `{name}` | {s['n']} | {s['p50']:.2f} | {s['p95']:.2f} | {s['p99']:.2f} | "
@@ -496,12 +528,19 @@ def render(result: Run) -> str:
         for name, m in result.paths.items()
     )
     rounds = len(next(iter(result.paths.values())).rounds) if result.paths else 0
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    environment = f"{platform.system()} {platform.release()} ({platform.machine()})"
+    revision = source_revision()
     return f"""# Performance
 
-Regenerate with `python -m perf.benchmark --write`. Enforced in CI by
+Regenerate with `python3 -m perf.benchmark --write`. Enforced in CI by
 `make perf`, which exits non-zero on a breached budget.
 
 ## Measured
+
+Generated at `{generated_at}` on `{environment}` with Python `{platform.python_version()}`.
+Measured source: `{revision}`. A dirty result includes uncommitted code and is
+not attributable to the named commit alone.
 
 {rounds} independent rounds, each {result.concurrency} concurrent clients running
 {result.iterations} iterations, ASGI in-process. Latencies in milliseconds.

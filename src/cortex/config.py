@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     #: HTTP transports are what `mcp_host`/`mcp_port` apply to.
     mcp_transport: str = "stdio"
     #: `execute_code` runs a subprocess with this process's privileges. It is
-    #: NOT a sandbox (see docs/MCP.md), so it is off unless deliberately
+    #: NOT a sandbox (see docs/THREAT_MODEL.md), so it is off unless deliberately
     #: enabled on a host where arbitrary code execution is already acceptable.
     code_execution_enabled: bool = False
     #: MCP tools reachable through `POST /api/v1/mcp/call`. Anything not listed
@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     #: inventing one would be worse than having none. What is honest is an
     #: operator *declaring* whose data a single-tenant process may touch -
     #: which is exactly the stdio case, where one process serves one desktop
-    #: client belonging to one person. See docs/MCP.md.
+    #: client belonging to one person. See docs/THREAT_MODEL.md.
     mcp_principal_user_id: str | None = None
     mcp_principal_tenant_id: str = "default"
 

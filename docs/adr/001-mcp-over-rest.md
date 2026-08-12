@@ -1,55 +1,41 @@
-# ADR 001: Use MCP over Custom REST for Tool Exposure
+# ADR 001: Use MCP for tool exposure
 
-**Status:** Accepted  
-**Date:** 2026-01  
-**Deciders:** Cortex core team  
-
----
+- **Status:** Accepted
+- **Date:** 2026-01
+- **Owner:** `@mrinmoyece`
 
 ## Context
 
-Cortex exposes capabilities (search, memory, code execution, data query) to external clients — both human-operated tools (Claude Desktop, VS Code) and automated agents. We needed to decide how to expose these capabilities.
-
-Options considered:
-1. Custom REST API with OpenAPI spec
-2. gRPC with protobuf schemas
-3. Model Context Protocol (MCP)
-
----
+Cortex tools must be discoverable by agent clients while remaining callable
+from the authenticated HTTP API and internal graph. A bespoke REST contract
+would require separate schemas and adapters for MCP-capable clients.
 
 ## Decision
 
-We use **Model Context Protocol (MCP)** as the tool exposure standard.
+Define tool implementations once and expose them through MCP discovery. Use an
+in-process client for the graph and an allowlisted FastAPI adapter for
+authenticated network calls.
 
----
-
-## Rationale
-
-**Native LLM client compatibility.** MCP is the protocol adopted by Anthropic, OpenAI (via adapters), and major IDE vendors. Any MCP-compatible client can connect to Cortex without custom integration code. This is an order of magnitude less friction than a bespoke REST API.
-
-**Standardised tool discovery.** MCP clients automatically discover available tools, their schemas, and descriptions. No separate documentation step required for tool consumers.
-
-**Future-proof.** The ecosystem around MCP is growing rapidly. Tools, clients, and server implementations are being standardised. Aligning with this now avoids a migration later.
-
-**Composability.** Cortex can itself act as an MCP client and consume tools from other MCP servers (GitHub, Jira, Slack) without additional adapters.
-
----
+MCP transport is not treated as authentication. Standalone stdio trusts its
+process launcher; standalone HTTP/SSE has no repository-provided caller
+identity. Per-user network tool access goes through
+`POST /api/v1/mcp/call`, where JWT claims are bound to a `Principal`.
 
 ## Consequences
 
-**Positive:**
-- Claude Desktop, VS Code Copilot, and any other MCP client can use Cortex tools out of the box.
-- Tool schemas are self-documenting.
-- We can consume other MCP servers natively.
+- Tool schemas and implementations remain shared across clients and the graph.
+- MCP-compatible desktop clients can use stdio without a custom adapter.
+- The API adapter must validate arguments, restrict exposed tool names, and
+  preserve principal binding.
+- Standalone MCP HTTP/SSE must remain on a trusted network and cannot expose
+  principal-dependent tools safely without a future authentication design.
+- The application maintains two transport surfaces even though business logic
+  is shared.
 
-**Negative:**
-- MCP is not yet universally supported — some enterprise systems will still need REST adapters.
-- MCP tooling (debugging, testing) is less mature than REST tooling.
-- We maintain both the MCP server (for LLM clients) and a REST API (for human-facing UIs and non-MCP systems).
+## Evidence
 
----
-
-## Mitigations
-
-- The FastAPI REST layer wraps the same underlying tool functions. There is no duplication of business logic — only the transport layer differs.
-- We will add REST-to-MCP adapters for legacy enterprise integrations as needed.
+- [`src/cortex/mcp/server.py`](../../src/cortex/mcp/server.py)
+- [`src/cortex/mcp/client.py`](../../src/cortex/mcp/client.py)
+- [`src/cortex/mcp/catalog.py`](../../src/cortex/mcp/catalog.py)
+- [`tests/test_mcp`](../../tests/test_mcp)
+- [Threat model](../THREAT_MODEL.md#trust-boundaries)

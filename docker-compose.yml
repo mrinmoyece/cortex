@@ -13,11 +13,20 @@
 #   grafana        — Dashboards (port 3000)
 # ─────────────────────────────────────────────────────────────────────────────
 
+x-cortex-environment: &cortex-environment
+  # `.env.example` uses host-local URLs for running console scripts directly.
+  # Containers must use Compose DNS names instead of their own loopback.
+  REDIS_URL: redis://redis:6379/0
+  QDRANT_URL: http://qdrant:6333
+  OTEL_EXPORTER_ENDPOINT: http://phoenix:4317
+  PHOENIX_ENDPOINT: http://phoenix:6006
+
 x-cortex-common: &cortex-common
   build:
     context: .
     dockerfile: Dockerfile
   env_file: .env
+  environment: *cortex-environment
   # The mapping key was missing on the first entry, which made this file
   # invalid YAML - `docker compose up` failed before starting anything, so
   # the documented quickstart could never have worked.
@@ -49,6 +58,7 @@ services:
     <<: *cortex-common
     command: cortex-mcp
     environment:
+      <<: *cortex-environment
       # The default transport is stdio, which exits immediately with no
       # attached client. A container has to speak HTTP to be reachable.
       MCP_TRANSPORT: http
@@ -72,6 +82,7 @@ services:
     build: .
     command: celery -A cortex.workers.celery_app flower --port=5555
     env_file: .env
+    environment: *cortex-environment
     ports: ["5555:5555"]
     depends_on:
       redis:
@@ -97,7 +108,7 @@ services:
     volumes:
       - qdrant-data:/qdrant/storage
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
       interval: 10s

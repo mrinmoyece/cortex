@@ -1,88 +1,43 @@
-# ADR 003: Multi-LLM Routing via LiteLLM
+# ADR 003: Centralize model calls behind LiteLLM
 
-**Status:** Accepted  
-**Date:** 2026-01  
-
----
+- **Status:** Accepted
+- **Date:** 2026-01
+- **Owner:** `@mrinmoyece`
 
 ## Context
 
-Cortex needs to call LLMs from multiple providers (OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Google Vertex). Users deploy Cortex in environments that may only have access to one provider. The application code should not need to change based on which provider is available.
-
-Options considered:
-1. Direct SDK calls per provider with an abstraction layer we build
-2. LiteLLM as the abstraction layer
-3. LangChain's LLM abstraction
-4. OpenAI SDK only (drop non-OpenAI providers)
-
----
+Agents, tools, moderation, and evaluation need a provider-neutral completion
+interface with consistent retry, fallback, cost, cache, telemetry, and error
+behavior.
 
 ## Decision
 
-Use **LiteLLM** as the single interface for all LLM calls.
+Use LiteLLM behind one Cortex router. The router:
 
----
+1. checks the per-run Redis cost ledger;
+2. attempts a tenant/model-scoped semantic-cache read when scope exists;
+3. calls the configured primary model with retry behavior;
+4. uses the configured fallback after retry exhaustion;
+5. calculates and records provider cost; and
+6. emits metrics and stores an eligible scoped cache entry.
 
-## Rationale
-
-**Universal interface.** LiteLLM provides a single `completion()` / `acompletion()` call that works with 100+ models across all major providers. We do not need to write and maintain per-provider adapters.
-
-**Cost calculation.** LiteLLM's `completion_cost()` function provides accurate per-request cost estimates for all supported models. This is essential for our budget enforcement system.
-
-**Fallback routing.** LiteLLM supports fallback model lists natively. We layer our own fallback logic on top (primary → fallback model) because we want explicit control over fallback behaviour and logging.
-
-**Not LangChain.** LangChain's LLM abstraction is higher-level and pulls in a larger dependency footprint. We use LangChain for message schema compatibility (`BaseMessage`) but not for LLM calls — LiteLLM gives us a thinner, faster layer.
-
----
-
-## Routing Strategy
-
-```
-Request
-  │
-  ▼
-Budget check (Redis)
-  │ over budget → raise LLMBudgetExceededError
-  ▼
-Semantic cache lookup (Qdrant)
-  │ hit → return cached response
-  ▼
-Primary model (DEFAULT_MODEL)
-  │ rate limit → retry with exponential backoff (3 attempts)
-  │ persistent failure → fallback model
-  ▼
-Fallback model (FALLBACK_MODEL)
-  │ failure → raise LLMProviderUnavailableError
-  ▼
-Record cost to Redis
-Emit Prometheus metrics
-Store in semantic cache
-Return response
-```
-
----
+Runtime model selection comes from validated settings.
 
 ## Consequences
 
-**Positive:**
-- Single place to add cost tracking, caching, retry logic.
-- Provider switching requires only a config change, no code changes.
-- Fallback logic is transparent and logged.
+- Provider switching does not require changes in each agent.
+- Cost, cache, retry, telemetry, and failure mapping are applied consistently.
+- LiteLLM model metadata and compatibility become runtime dependencies.
+- Missing pricing metadata must be surfaced without inventing cost.
+- Cache failures degrade to provider calls, while an unscoped call skips the
+  cache to preserve isolation.
+- Provider-specific features remain limited to LiteLLM's common interface or
+  require explicit router work.
 
-**Negative:**
-- LiteLLM adds ~50ms cold-start overhead (model config loading). Mitigated by using a module-level singleton.
-- LiteLLM is a third-party dependency with its own release cadence. We pin major versions and test on upgrades.
+## Evidence
 
----
-
-## Cost Model Config
-
-Provider routing can be extended via `config/models.yaml` to route different task types to different models:
-
-```yaml
-routing:
-  planning: gpt-4o          # High-quality planning
-  execution: gpt-4o-mini    # Cheap tool calls
-  critic: gpt-4o            # High-quality evaluation
-  embedding: text-embedding-3-large
-```
+- [`src/cortex/llm/router.py`](../../src/cortex/llm/router.py)
+- [`src/cortex/llm/cost_tracker.py`](../../src/cortex/llm/cost_tracker.py)
+- [`src/cortex/llm/cache.py`](../../src/cortex/llm/cache.py)
+- [`tests/test_llm`](../../tests/test_llm)
+- [Architecture: LLM routing, cache, and cost](../ARCHITECTURE.md#llm-routing-cache-and-cost)

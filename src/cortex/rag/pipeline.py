@@ -12,7 +12,9 @@ Production-grade retrieval-augmented generation with:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import threading
 import time
 import uuid
 from typing import Any
@@ -93,7 +95,8 @@ class Document:
         # content-addressing (same content and chunk index -> same id) while
         # producing an id Qdrant will actually accept.
         chunk_index = (metadata or {}).get("chunk_index", 0)
-        self.id = str(uuid.uuid5(_DOC_NAMESPACE, f"{self.doc_hash}:{chunk_index}"))
+        source = (metadata or {}).get("source", "")
+        self.id = str(uuid.uuid5(_DOC_NAMESPACE, f"{source}:{self.doc_hash}:{chunk_index}"))
         self.metadata = metadata or {}
         self.embedding: list[float] | None = None
 
@@ -279,13 +282,24 @@ class SparseRetriever:
     """
 
     def __init__(self) -> None:
-        self._corpus: list[Document] = []
-        self._index: BM25Okapi | None = None
+        # Corpus and index are held as one immutable tuple, published by a
+        # single attribute assignment. `search()` now runs in a worker thread
+        # (see `RAGPipeline.retrieve`) while `index()` runs on the event loop,
+        # so two separate attributes could be read half-updated: BM25 scores
+        # from the new index used as positional offsets into the old corpus
+        # raises IndexError, or silently returns the wrong document. Readers
+        # take one reference and are unaffected by any later re-index.
+        self._snapshot: tuple[tuple[Document, ...], BM25Okapi | None] = ((), None)
+        #: Serialises writers so two concurrent `index()` calls cannot
+        #: interleave into a corpus from one and an index from the other.
+        self._write_lock = threading.Lock()
 
     def index(self, documents: list[Document]) -> None:
-        self._corpus = documents
-        tokenised = [doc.content.lower().split() for doc in documents]
-        self._index = BM25Okapi(tokenised) if tokenised else None
+        corpus = tuple(documents)
+        tokenised = [doc.content.lower().split() for doc in corpus]
+        index = BM25Okapi(tokenised) if tokenised else None
+        with self._write_lock:
+            self._snapshot = (corpus, index)
 
     def search(
         self, query: str, top_k: int, filters: dict[str, Any] | None = None
@@ -298,16 +312,17 @@ class SparseRetriever:
         document and BM25 hands it back. A filter enforced on one of two
         retrieval paths is not a filter.
         """
-        if not self._index or not self._corpus:
+        corpus, index = self._snapshot
+        if not index or not corpus:
             return []
         tokens = query.lower().split()
-        scores = self._index.get_scores(tokens)
+        scores = index.get_scores(tokens)
         ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
         results = []
         for i, s in ranked:
             if s <= 0:
                 continue
-            doc = self._corpus[i]
+            doc = corpus[i]
             if not matches_payload_filter(doc.metadata, filters):
                 continue
             results.append(
@@ -437,6 +452,11 @@ class RAGPipeline:
         # for the lifetime of the process, so without a cap a long-running
         # API worker grows until it is killed. Oldest chunks are dropped
         # first - they remain in Qdrant and are still retrievable densely.
+        # Upsert replaces Qdrant points, so the in-process BM25 corpus must
+        # replace the same identities too. Otherwise each re-ingestion
+        # increasingly biases sparse ranking toward old documents.
+        chunk_ids = {chunk.id for chunk in chunks}
+        self._all_docs = [doc for doc in self._all_docs if doc.id not in chunk_ids]
         self._all_docs.extend(chunks)
         max_docs = int(settings.rag_max_indexed_chunks)
         if len(self._all_docs) > max_docs:
@@ -469,8 +489,8 @@ class RAGPipeline:
             # Parallel dense + sparse search
             query_embedding = (await self._embedder.embed_batch([query]))[0]
             dense_task = self._vector_store.search(query_embedding, top_k=top_k, filters=filters)
-            sparse_results = self._sparse.search(query, top_k=top_k, filters=filters)
-            dense_results = await dense_task
+            sparse_task = asyncio.to_thread(self._sparse.search, query, top_k, filters)
+            dense_results, sparse_results = await asyncio.gather(dense_task, sparse_task)
 
             # Reciprocal Rank Fusion
             fused = self._rrf_fuse(dense_results, sparse_results, k=60)

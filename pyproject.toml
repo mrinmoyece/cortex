@@ -102,6 +102,9 @@ dev = [
     "ruff>=0.7.0",
     "mypy>=1.13.0",
     "pre-commit>=4.0.0",
+    # Required by `make gate`, not only by the hosted CI workflow.
+    "bandit>=1.7.10",
+    "pip-audit>=2.7.0",
     "tomli>=2.0.0; python_version < '3.11'",
 ]
 
