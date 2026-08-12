@@ -113,10 +113,13 @@ async def _run_total_cost(agent: Any, state: CortexState, cost_delta: float) -> 
 
     The router's Redis ledger sees spend the graph does not: the executor
     makes an extra LLM call after the task itself (output compilation), and
-    MCP tools bill their own completions to this run id. But that ledger
-    carries a one-hour TTL and is evictable, and an expired key reads as
-    `0.0` rather than raising — so trusting it outright lets a long run's
-    reported cost fall back to zero.
+    MCP tools bill their own completions to this run id. But that ledger is
+    not durable. It lives in the *cache* database, which the shipped
+    `docker-compose.yml` runs under `--maxmemory-policy allkeys-lru`, so a
+    cost key is evictable at any time under memory pressure; it also carries
+    a one-hour TTL, refreshed per write, so a run idle for that long loses
+    it. Neither case raises — a missing key reads as `0.0` — so trusting the
+    ledger outright lets a run's reported cost silently fall back to zero.
 
     The locally accumulated total misses the spend above, but it only ever
     grows. Taking the larger keeps both properties: the ledger's coverage,

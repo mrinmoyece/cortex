@@ -154,12 +154,14 @@ class TestExecutorNode:
         assert out["total_cost_usd"] == pytest.approx(0.15), "degrades to the accumulated total"
 
     @pytest.mark.asyncio
-    async def test_an_expired_cost_ledger_cannot_reset_the_run_total(self):
-        """The ledger carries a one-hour TTL and is evictable. An expired key
-        reads as 0.0 rather than raising, so trusting it outright lets a long
-        run's reported cost fall back to zero - and `route_after_executor`
-        ends a run on exactly this value, so a total that can reset is a
-        budget guard that can be outlived."""
+    async def test_a_lost_cost_ledger_cannot_reset_the_run_total(self):
+        """The ledger is not durable: it lives in the cache database, which
+        ships under `allkeys-lru`, so a cost key is evictable at any time
+        under memory pressure. A missing key reads as 0.0 rather than
+        raising, so trusting it outright lets a run's reported cost fall back
+        to zero - and `route_after_executor` ends a run on exactly this
+        value, so a total that can reset is a budget guard that can be
+        outlived."""
         t = _task("a")
         state = _state(tasks=[t], total_cost_usd=1.80)
         with patch("cortex.graph.cortex_graph.ExecutorAgent") as agent_cls:
@@ -168,13 +170,13 @@ class TestExecutorNode:
                 return_value=(t.mark_started().mark_completed("ok"), 0.05)
             )
             agent.compile_output = AsyncMock(return_value="final")
-            agent.get_run_cost = AsyncMock(return_value=0.0)  # key expired
+            agent.get_run_cost = AsyncMock(return_value=0.0)  # evicted / expired
             out = await executor_node(state)
 
         assert out["total_cost_usd"] == pytest.approx(1.85)
 
     @pytest.mark.asyncio
-    async def test_the_budget_guard_still_fires_after_the_ledger_expires(self):
+    async def test_the_budget_guard_still_fires_after_the_ledger_is_lost(self):
         """The guard is the reason monotonicity matters. Driven through the
         real router so this fails if the accounting regresses."""
         t = _task("a")
@@ -185,7 +187,7 @@ class TestExecutorNode:
                 return_value=(t.mark_started().mark_completed("ok"), 0.05)
             )
             agent.compile_output = AsyncMock(return_value="final")
-            agent.get_run_cost = AsyncMock(return_value=0.0)  # key expired
+            agent.get_run_cost = AsyncMock(return_value=0.0)  # evicted / expired
             out = await executor_node(state)
 
         spent = state.model_copy(update={**out, "status": RunStatus.EXECUTING})
