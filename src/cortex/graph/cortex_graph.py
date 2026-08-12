@@ -106,6 +106,24 @@ async def planner_node(state: CortexState) -> dict[str, Any]:
         return {"status": RunStatus.FAILED, "error": f"Planning failed: {exc}"}
 
 
+async def _run_total_cost(agent: Any, state: CortexState, cost_delta: float) -> float:
+    """Best available figure for what this run has cost so far.
+
+    The router's ledger is authoritative: the executor can make an extra LLM
+    call after the task itself (output compilation), so the per-task delta
+    alone under-reports. But the ledger lives in Redis, and a lookup failure
+    there must not be able to reach the caller — it is raised from the same
+    `try` that guards task execution, so an unhandled failure would mark a
+    task that actually succeeded as failed and throw its result away.
+    Accounting degrades to the locally accumulated total instead.
+    """
+    try:
+        return float(await agent.get_run_cost(state.run_id))
+    except Exception as exc:  # accounting must not be able to fail a run
+        logger.warning("executor.cost_ledger_unavailable", run_id=state.run_id, error=str(exc))
+        return state.total_cost_usd + cost_delta
+
+
 async def executor_node(state: CortexState) -> dict[str, Any]:
     """Execute the next pending task using MCP tools."""
     agent = ExecutorAgent()
@@ -125,7 +143,7 @@ async def executor_node(state: CortexState) -> dict[str, Any]:
     task = ready[0]
 
     try:
-        updated_task, _cost_delta = await agent.execute_task(task, state)
+        updated_task, cost_delta = await agent.execute_task(task, state)
         updated_tasks = [updated_task if t.id == task.id else t for t in state.tasks]
 
         all_done = all(t.status.value in ("completed", "skipped", "failed") for t in updated_tasks)
@@ -139,8 +157,8 @@ async def executor_node(state: CortexState) -> dict[str, Any]:
             "tasks": updated_tasks,
             "final_output": output,
             # The compiler can make an additional LLM call after the task,
-            # so use the ledger total rather than only the task delta.
-            "total_cost_usd": await agent.get_run_cost(state.run_id),
+            # so the ledger total is preferred over the task delta alone.
+            "total_cost_usd": await _run_total_cost(agent, state, cost_delta),
             "status": RunStatus.CRITIQUING if all_done else RunStatus.EXECUTING,
         }
 

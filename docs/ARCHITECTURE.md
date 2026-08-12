@@ -239,6 +239,13 @@ interface. Before a provider call, it checks the Redis cost ledger against
 `MAX_COST_PER_RUN_USD`. A successful response is costed through LiteLLM and
 recorded by [`cost_tracker.py`](../src/cortex/llm/cost_tracker.py).
 
+The ledger is keyed by run id, so every call a run makes has to carry that id
+for the gate to see it. Two MCP tools (`query_data`, `synthesise`) call the
+router themselves; when they are invoked from a graph run, the executor binds
+the run id out of band — the same way it binds the calling principal, and for
+the same reason: a billing identity taken from model-written arguments is not
+one. A standalone MCP call has no enclosing run and gets its own ledger.
+
 [`llm/cache.py`](../src/cortex/llm/cache.py) embeds prompt text, stores only a
 digest with the response payload, and filters by model and caller-provided
 scope. An unscoped call bypasses the cache. Cache failures degrade to provider

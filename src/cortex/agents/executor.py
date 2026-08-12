@@ -148,10 +148,16 @@ class ExecutorAgent:
         `CortexState`, which took it from the authenticated request that
         created the run; it is never taken from `arguments`, which the model
         writes.
+
+        The run id is bound alongside it, so LLM calls a tool makes for
+        itself (`query_data`, `synthesise`) are metered against this run's
+        budget rather than a private ledger the run cannot see.
         """
         principal = Principal(user_id=state.user_id, tenant_id=state.tenant_id)
         try:
-            result = await self._mcp.call_tool(tool_name, arguments, principal=principal)
+            result = await self._mcp.call_tool(
+                tool_name, arguments, principal=principal, run_id=state.run_id
+            )
             logger.debug("mcp.tool_called", tool=tool_name, run_id=state.run_id)
             return {"success": True, "result": result}
         except Exception as exc:

@@ -70,14 +70,15 @@ class MCPClient:
 
     @staticmethod
     @contextlib.contextmanager
-    def _bound(principal: Principal | None) -> Iterator[None]:
-        """Bind `principal` for the call, if one was supplied."""
-        if principal is None:
-            yield
-            return
-        from cortex.mcp.server import use_principal
+    def _bound(principal: Principal | None, run_id: str | None) -> Iterator[None]:
+        """Bind the out-of-band call context: identity, and cost ledger."""
+        from cortex.mcp.server import use_principal, use_run_id
 
-        with use_principal(principal):
+        with contextlib.ExitStack() as stack:
+            if principal is not None:
+                stack.enter_context(use_principal(principal))
+            if run_id is not None:
+                stack.enter_context(use_run_id(run_id))
             yield
 
     async def call_tool(
@@ -86,6 +87,7 @@ class MCPClient:
         arguments: dict[str, Any],
         *,
         principal: Principal | None = None,
+        run_id: str | None = None,
     ) -> Any:
         """Invoke an MCP tool by name with the given arguments.
 
@@ -93,6 +95,10 @@ class MCPClient:
         passed here rather than in `arguments` on purpose: `arguments` comes
         from the model or from an HTTP body, and identity must not be
         something either of those can choose.
+
+        `run_id` is the cost ledger the tool's own LLM calls bill to, and is
+        passed the same way for the same reason. Omitting it leaves each such
+        call on its own ledger, which is what a standalone MCP caller wants.
         """
         if not self._tools:
             self._register_local_tools()
@@ -119,7 +125,7 @@ class MCPClient:
             ) from exc
 
         try:
-            with self._bound(principal):
+            with self._bound(principal, run_id):
                 result = await tool_fn(**arguments)
             logger.debug("mcp.tool_success", tool=tool_name)
             return result

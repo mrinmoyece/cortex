@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 import time
 import uuid
 from typing import Any
@@ -281,13 +282,24 @@ class SparseRetriever:
     """
 
     def __init__(self) -> None:
-        self._corpus: list[Document] = []
-        self._index: BM25Okapi | None = None
+        # Corpus and index are held as one immutable tuple, published by a
+        # single attribute assignment. `search()` now runs in a worker thread
+        # (see `RAGPipeline.retrieve`) while `index()` runs on the event loop,
+        # so two separate attributes could be read half-updated: BM25 scores
+        # from the new index used as positional offsets into the old corpus
+        # raises IndexError, or silently returns the wrong document. Readers
+        # take one reference and are unaffected by any later re-index.
+        self._snapshot: tuple[tuple[Document, ...], BM25Okapi | None] = ((), None)
+        #: Serialises writers so two concurrent `index()` calls cannot
+        #: interleave into a corpus from one and an index from the other.
+        self._write_lock = threading.Lock()
 
     def index(self, documents: list[Document]) -> None:
-        self._corpus = documents
-        tokenised = [doc.content.lower().split() for doc in documents]
-        self._index = BM25Okapi(tokenised) if tokenised else None
+        corpus = tuple(documents)
+        tokenised = [doc.content.lower().split() for doc in corpus]
+        index = BM25Okapi(tokenised) if tokenised else None
+        with self._write_lock:
+            self._snapshot = (corpus, index)
 
     def search(
         self, query: str, top_k: int, filters: dict[str, Any] | None = None
@@ -300,16 +312,17 @@ class SparseRetriever:
         document and BM25 hands it back. A filter enforced on one of two
         retrieval paths is not a filter.
         """
-        if not self._index or not self._corpus:
+        corpus, index = self._snapshot
+        if not index or not corpus:
             return []
         tokens = query.lower().split()
-        scores = self._index.get_scores(tokens)
+        scores = index.get_scores(tokens)
         ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
         results = []
         for i, s in ranked:
             if s <= 0:
                 continue
-            doc = self._corpus[i]
+            doc = corpus[i]
             if not matches_payload_filter(doc.metadata, filters):
                 continue
             results.append(
