@@ -232,6 +232,10 @@ infrastructure before treating a run as evidence.
 2. Inspect per-run Redis summaries and iteration/task counts.
 3. Check cache-hit behavior and cache scope.
 4. Lower `MAX_COST_PER_RUN_USD` or stop traffic if the ledger is trustworthy.
+   Check for `executor.cost_ledger_unavailable` and
+   `executor.cost_ledger_below_accumulated` first: either means run spend is
+   being under-reported and the router's gate is reading low
+   ([Limitations](LIMITATIONS.md#the-cost-ledger-is-not-durable)).
 5. Reconcile provider billing separately; Redis cost data is not durable
    accounting.
 
