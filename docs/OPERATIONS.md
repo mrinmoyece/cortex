@@ -30,9 +30,7 @@ Important controls:
 | `HUMAN_REVIEW_BEFORE_CRITIC` | `false` | Suspends before critique; no resume API exists |
 | `RAG_MAX_INDEXED_CHUNKS` | `50000` | Per-process sparse index bound |
 
-[`config/models.yaml`](../config/models.yaml) is not loaded by the runtime or
-mounted by shipped deployments. Do not edit it expecting routing to change;
-use runtime settings until that configuration is wired and tested.
+Runtime settings are the only supported model-routing configuration.
 
 The Colang files under [`config/rails`](../config/rails) are likewise not
 mounted in the shipped containers. Local safety checks still run, but the
@@ -79,24 +77,21 @@ kubectl rollout status deployment/cortex-api -n cortex
 kubectl get pods,svc,ingress -n cortex
 ```
 
-The API manifest starts with two replicas and an HPA; workers have a static
-replica count; beat must remain at one replica. Because run state, checkpoints,
-rate limits, and sparse retrieval are process-local, horizontally scaling the
-API does not make those features consistent across replicas.
+The API manifest deliberately fixes the API at one replica and one worker;
+workers have a static replica count; beat remains at one replica and uses a
+`Recreate` strategy to prevent overlap during rollout. Run state, checkpoints,
+rate limits, and sparse retrieval are process-local, so do not scale the API
+until those stores are shared.
 
 ```mermaid
 flowchart TB
-    Ingress[Ingress] --> API1[API replica 1]
-    Ingress --> API2[API replica 2]
+    Ingress[Ingress] --> API1[API replica]
     API1 --> Redis[(Managed Redis)]
-    API2 --> Redis
     API1 --> Qdrant[(Qdrant)]
-    API2 --> Qdrant
     Worker[Celery workers] --> Redis
     Worker --> Qdrant
     Beat[Single Celery beat] --> Redis
     Prom[Prometheus] -->|/metrics| API1
-    Prom -->|/metrics| API2
 ```
 
 The manifest includes an ingress-nginx `server-snippet` intended to deny
@@ -216,13 +211,12 @@ infrastructure before treating a run as evidence.
 
 ### Runs remain pending or disappear
 
-1. Identify the API replica that accepted the run.
-2. Check for a restart, TTL/LRU eviction, or polling against another replica.
-3. Confirm the background task reached `_execute_run`.
-4. Treat lost state as unrecoverable; the run store and checkpointer are not
+1. Check for a restart or TTL/LRU eviction.
+2. Confirm the background task reached `_execute_run`.
+3. Treat lost state as unrecoverable; the run store and checkpointer are not
    durable.
-5. Reduce replica ambiguity or implement a shared run store before relying on
-   run polling operationally.
+4. Implement a shared run store before scaling or relying on run polling
+   operationally.
 
 ### High agent failure or latency
 

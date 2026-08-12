@@ -21,8 +21,7 @@ Use LiteLLM behind one Cortex router. The router:
 5. calculates and records provider cost; and
 6. emits metrics and stores an eligible scoped cache entry.
 
-Runtime model selection comes from validated settings. The current
-`config/models.yaml` file is not loaded and is not an architectural authority.
+Runtime model selection comes from validated settings.
 
 ## Consequences
 

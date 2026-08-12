@@ -170,6 +170,9 @@ class TestDocumentIdIsAcceptableToQdrant:
         assert Document("same").id == Document("same").id
         assert Document("same").id != Document("other").id
 
+    def test_identical_content_from_distinct_sources_has_distinct_ids(self):
+        assert Document("same", {"source": "one"}).id != Document("same", {"source": "two"}).id
+
 
 class TestSparseRetrievalHonoursFilters:
     """Dense search enforced `filters`; sparse did not. A filtered hybrid

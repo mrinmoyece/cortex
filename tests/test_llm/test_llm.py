@@ -64,6 +64,17 @@ class TestCostTracker:
         assert await tracker.get_run_cost("never-seen") == 0.0
 
     @pytest.mark.asyncio
+    async def test_missing_provider_usage_is_recorded_as_zero_tokens(self, tracker):
+        response = AsyncMock()
+        response.usage = None
+
+        await tracker.record(run_id="r", model="gpt-4o", cost_usd=0.01, response=response)
+
+        summary = await tracker.get_run_summary("r")
+        assert summary["total_prompt_tokens"] == 0
+        assert summary["total_completion_tokens"] == 0
+
+    @pytest.mark.asyncio
     async def test_summary_breaks_cost_down_by_model(self, tracker):
         await tracker.record(run_id="r", model="gpt-4o", cost_usd=0.10, response=_response())
         await tracker.record(run_id="r", model="gpt-4o-mini", cost_usd=0.01, response=_response())

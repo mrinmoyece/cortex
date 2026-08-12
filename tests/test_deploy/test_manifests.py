@@ -54,6 +54,10 @@ class TestComposeFileIsUsable:
         assert "sk-" not in text
         assert "${GRAFANA_ADMIN_PASSWORD" in text
 
+    def test_qdrant_is_not_published_to_all_host_interfaces(self):
+        ports = _load("docker-compose.yml")["services"]["qdrant"]["ports"]
+        assert "127.0.0.1:6333:6333" in ports
+
 
 class TestKubernetesMetricsIsCoherent:
     """Metrics were scraped by pod annotation - which sends no credential -
@@ -91,6 +95,10 @@ class TestKubernetesMetricsIsCoherent:
 
 
 class TestKubernetesWorkloadsAreConsistent:
+    def test_secret_manifest_has_no_default_jwt_signing_key(self):
+        secret = next(d for d in _load_all("deploy/k8s/service.yaml") if d["kind"] == "Secret")
+        assert "SECRET_KEY" not in secret.get("stringData", {})
+
     def test_every_workload_runs_as_non_root(self):
         for doc in _load_all("deploy/k8s/deployment.yaml"):
             if doc["kind"] != "Deployment":

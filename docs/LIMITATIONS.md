@@ -113,9 +113,8 @@ See [Evaluation](EVALUATION.md).
 
 ### Configuration artifacts are partially illustrative
 
-[`config/models.yaml`](../config/models.yaml) describes routing and pricing but
-is not loaded or mounted. Runtime model settings remain authoritative. The
-same distinction applies to unmounted Colang files.
+Runtime model settings remain authoritative. The unmounted Colang files are
+illustrative rather than active safety controls.
 
 ## Roadmap
 

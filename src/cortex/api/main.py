@@ -160,7 +160,7 @@ async def telemetry_middleware(
 
     labels = {
         "method": request.method,
-        "endpoint": request.url.path,
+        "endpoint": getattr(request.scope.get("route"), "path", "unmatched"),
         "status_code": str(response.status_code),
     }
     api_request_duration.labels(**labels).observe(elapsed)

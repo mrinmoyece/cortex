@@ -69,7 +69,7 @@ class ExecutorAgent:
         tools = await self._mcp.get_tool_schemas()
 
         # Allow up to 3 tool-call rounds per task
-        cost_before = state.total_cost_usd
+        cost_before = await self._router.get_run_cost(state.run_id)
         for round_num in range(3):
             response = await self._router.complete(
                 messages=messages,
@@ -90,11 +90,11 @@ class ExecutorAgent:
                     logger.warning(
                         "executor.task_failed", run_id=state.run_id, task_id=task.id, error=error
                     )
-                    cost_delta = state.total_cost_usd - cost_before
+                    cost_delta = await self._router.get_run_cost(state.run_id) - cost_before
                     return task.mark_failed(error), cost_delta
 
                 logger.info("executor.task_complete", run_id=state.run_id, task_id=task.id)
-                cost_delta = state.total_cost_usd - cost_before
+                cost_delta = await self._router.get_run_cost(state.run_id) - cost_before
                 return task.mark_completed(content), cost_delta
 
             # Execute tool calls
@@ -133,7 +133,7 @@ class ExecutorAgent:
                 )
 
         # Exhausted rounds without a final answer
-        cost_delta = state.total_cost_usd - cost_before
+        cost_delta = await self._router.get_run_cost(state.run_id) - cost_before
         return task.mark_failed("Exceeded maximum tool-call rounds"), cost_delta
 
     async def _call_mcp_tool(
@@ -160,6 +160,10 @@ class ExecutorAgent:
             # something the executor is expected to work around, and one bad
             # call should not abandon a task that has two more rounds left.
             return {"success": False, "error": str(exc)}
+
+    async def get_run_cost(self, run_id: str) -> float:
+        """Return the router ledger total for graph-level accounting."""
+        return await self._router.get_run_cost(run_id)
 
     def _build_task_prompt(self, task: Task, state: CortexState) -> str:
         parts = [

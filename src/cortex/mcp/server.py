@@ -31,6 +31,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -487,7 +488,7 @@ async def _to_sql(question: str, schema: str) -> str:
             },
             {"role": "user", "content": question},
         ],
-        run_id="mcp-query-data",
+        run_id=str(uuid.uuid4()),
         temperature=0.0,
     )
     sql = (response.choices[0].message.content or "").strip()
@@ -516,8 +517,9 @@ async def synthesise(
 
     router = get_router()
 
-    # Use a stub run_id for MCP tool calls
-    run_id = "mcp-synthesise"
+    # Direct MCP calls are independent requests. A shared constant would
+    # make unrelated callers consume each other's budget ledger.
+    run_id = str(uuid.uuid4())
     messages = [
         {
             "role": "system",

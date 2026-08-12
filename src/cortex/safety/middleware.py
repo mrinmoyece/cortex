@@ -13,6 +13,7 @@ degrades gracefully when safety libraries aren't installed.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, ClassVar
 
 from cortex.config import settings
@@ -173,12 +174,10 @@ class SafetyMiddleware:
 
     def _init_rails(self) -> None:
         try:
-            import os
-
             from nemoguardrails import LLMRails, RailsConfig
 
-            rails_path = os.path.join(os.path.dirname(__file__), "../../config/rails")
-            if os.path.exists(rails_path):
+            rails_path = Path(__file__).resolve().parents[3] / "config" / "rails"
+            if rails_path.exists():
                 config = RailsConfig.from_path(rails_path)
                 self._rails_app = LLMRails(config)
                 logger.info("guardrails.nemo_loaded")

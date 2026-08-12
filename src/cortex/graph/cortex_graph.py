@@ -125,7 +125,7 @@ async def executor_node(state: CortexState) -> dict[str, Any]:
     task = ready[0]
 
     try:
-        updated_task, cost_delta = await agent.execute_task(task, state)
+        updated_task, _cost_delta = await agent.execute_task(task, state)
         updated_tasks = [updated_task if t.id == task.id else t for t in state.tasks]
 
         all_done = all(t.status.value in ("completed", "skipped", "failed") for t in updated_tasks)
@@ -138,7 +138,9 @@ async def executor_node(state: CortexState) -> dict[str, Any]:
         return {
             "tasks": updated_tasks,
             "final_output": output,
-            "total_cost_usd": state.total_cost_usd + cost_delta,
+            # The compiler can make an additional LLM call after the task,
+            # so use the ledger total rather than only the task delta.
+            "total_cost_usd": await agent.get_run_cost(state.run_id),
             "status": RunStatus.CRITIQUING if all_done else RunStatus.EXECUTING,
         }
 

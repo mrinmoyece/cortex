@@ -80,8 +80,10 @@ class CostTracker:
         entry = CostEntry(
             model=model,
             cost_usd=cost_usd,
-            prompt_tokens=response.usage.prompt_tokens,
-            completion_tokens=response.usage.completion_tokens,
+            prompt_tokens=int(getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0),
+            completion_tokens=int(
+                getattr(getattr(response, "usage", None), "completion_tokens", 0) or 0
+            ),
         )
         key = f"{_COST_KEY_PREFIX}{run_id}"
         pipe = redis.pipeline()

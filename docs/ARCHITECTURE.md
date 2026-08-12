@@ -246,9 +246,7 @@ calls; moderation failures fail closed because moderation is a control rather
 than an optimization.
 
 Runtime model selection comes from settings such as `DEFAULT_MODEL` and
-`FALLBACK_MODEL`. [`config/models.yaml`](../config/models.yaml) is currently
-not loaded or mounted by the shipped runtime, so it is an example configuration
-and not an active routing authority.
+`FALLBACK_MODEL`.
 
 Tests:
 [`tests/test_llm`](../tests/test_llm).

@@ -79,6 +79,10 @@ class LLMRouter:
         if settings.cohere_api_key:
             litellm.cohere_key = settings.cohere_api_key.get_secret_value()
 
+    async def get_run_cost(self, run_id: str) -> float:
+        """Return the cumulative recorded cost for a run."""
+        return await self._cost_tracker.get_run_cost(run_id)
+
     async def complete(
         self,
         messages: list[dict[str, str]],
@@ -111,7 +115,7 @@ class LLMRouter:
         max_tokens = max_tokens or settings.max_tokens_per_request
 
         # Budget gate — checked before every call
-        current_cost = await self._cost_tracker.get_run_cost(run_id)
+        current_cost = await self.get_run_cost(run_id)
         if current_cost >= settings.max_cost_per_run_usd:
             raise LLMBudgetExceededError(
                 f"Run {run_id} has spent ${current_cost:.4f}, limit is ${settings.max_cost_per_run_usd}",
