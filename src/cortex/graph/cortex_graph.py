@@ -128,12 +128,20 @@ async def _run_total_cost(agent: Any, state: CortexState, cost_delta: float) -> 
     `MAX_COST_PER_RUN_USD` — a total that can reset is a budget guard that
     can be outlived.
 
+    The delta is clamped at zero for the same reason. `ExecutorAgent`
+    computes it as the difference between two ledger reads taken either side
+    of the task, so if the key is lost *between* them the second read is the
+    smaller one and the delta arrives negative. Adding that would walk the
+    run total backwards, and the ledger figure is depressed by the very same
+    eviction, so `max()` would not catch it. Spend is not refundable: a step
+    can only add.
+
     A ledger lookup that *fails* degrades to the accumulator alone. It is
     raised from the same `try` that guards task execution, so an unhandled
     failure would mark a task that actually succeeded as failed and throw
     its result away.
     """
-    accumulated = state.total_cost_usd + cost_delta
+    accumulated = state.total_cost_usd + max(cost_delta, 0.0)
     try:
         ledger_total = float(await agent.get_run_cost(state.run_id))
     except Exception as exc:  # accounting must not be able to fail a run

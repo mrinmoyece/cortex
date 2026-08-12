@@ -89,9 +89,13 @@ boundary.
 
 The graph-level budget/iteration branch currently ends without updating an
 `executing` state to `failed`. Callers can therefore observe a nonterminal
-status after graph execution. The LLM router still refuses provider calls when
-the Redis run ledger reaches `MAX_COST_PER_RUN_USD`; the graph status defect is
-tracked in [Limitations](LIMITATIONS.md#budget-and-iteration-exits-can-remain-nonterminal).
+status after graph execution. The LLM router separately refuses provider calls
+once the Redis run ledger reaches `MAX_COST_PER_RUN_USD`, but that ledger is
+not durable and reads as `$0.00` when it is missing, so the two gates degrade
+differently — see
+[Limitations](LIMITATIONS.md#the-cost-ledger-is-not-durable). The graph status
+defect is tracked in
+[Limitations](LIMITATIONS.md#budget-and-iteration-exits-can-remain-nonterminal).
 
 ## Agent graph and state
 
@@ -190,11 +194,15 @@ flowchart LR
 - optional Cohere reranking, with fused results returned when no key exists.
 
 The sparse index is process-local and bounded by `RAG_MAX_INDEXED_CHUNKS`.
-Supplied filters are applied to dense and sparse paths, but the HTTP ingestion
-path stores `ingested_by` rather than a tenant ID and `search_knowledge` does
-not derive a filter from the bound principal. The shipped RAG corpus is
-therefore shared across tenants. Tests live in
-[`tests/test_rag`](../tests/test_rag).
+BM25 scoring is CPU-bound, so retrieval runs it in a worker thread rather than
+on the event loop. Ingestion can therefore re-index while a search is in
+flight, and `SparseRetriever` holds its corpus and index as a single immutable
+tuple published under a writer lock: a reader takes one consistent generation
+and is unaffected by any later re-index. Supplied filters are applied to dense
+and sparse paths, but the HTTP ingestion path stores `ingested_by` rather than
+a tenant ID and `search_knowledge` does not derive a filter from the bound
+principal. The shipped RAG corpus is therefore shared across tenants. Tests
+live in [`tests/test_rag`](../tests/test_rag).
 
 ## Memory model
 
@@ -245,6 +253,15 @@ router themselves; when they are invoked from a graph run, the executor binds
 the run id out of band — the same way it binds the calling principal, and for
 the same reason: a billing identity taken from model-written arguments is not
 one. A standalone MCP call has no enclosing run and gets its own ledger.
+
+The ledger is also the only place that sees a run's full spend, since output
+compilation and MCP tool completions happen outside the graph's own arithmetic.
+It is not durable, though, and a missing key reads as `$0.00` rather than
+raising. `CortexState.total_cost_usd` therefore takes the larger of the ledger
+figure and the graph's locally accumulated total: the ledger contributes
+coverage, the accumulator contributes monotonicity, and a total that can only
+grow is one the graph's budget guard cannot be outlived by. See
+[Limitations](LIMITATIONS.md#the-cost-ledger-is-not-durable).
 
 [`llm/cache.py`](../src/cortex/llm/cache.py) embeds prompt text, stores only a
 digest with the response payload, and filters by model and caller-provided
