@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: install docs test lint fmt types security audit perf perf-report load gate
+.PHONY: install docs test lint fmt types security audit audit-fresh perf perf-report load gate
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]"
