@@ -41,7 +41,7 @@ dependencies = [
     "opentelemetry-sdk>=1.28.0",
     "opentelemetry-exporter-otlp>=1.28.0",
     "opentelemetry-instrumentation-fastapi>=0.49b0",
-    "arize-phoenix-otel>=0.6.0",
+    "arize-phoenix-otel>=0.17.0",
     "prometheus-client>=0.21.0",
 
     # API
