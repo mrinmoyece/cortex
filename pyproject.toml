@@ -98,7 +98,7 @@ dev = [
     # metrics layer; a direct import deserves a direct declaration, or an
     # unrelated upgrade silently breaks the suite.
     "starlette>=0.41.0",
-    "factory-boy>=3.3.0",
+    "factory-boy>=3.3.3",
     "ruff>=0.7.0",
     "mypy>=1.13.0",
     "pre-commit>=4.0.0",
